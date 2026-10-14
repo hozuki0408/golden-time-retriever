@@ -170,7 +170,9 @@ def main():
         sheet("log", message=f"{now()} 正常終了：監視中の商品なし")
         return
 
-    updates, token, blocked, counts, stopped = [], None, 0, {}, 0
+    # eBayの認証を最初に確認しておく（売り切れを見つけてから失敗するのを防ぐ）
+    token = get_access_token()
+    updates, blocked, counts, stopped = [], 0, {}, 0
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(
@@ -183,7 +185,6 @@ def main():
             counts[status] = counts.get(status, 0) + 1
             upd = {"row": r["row"], "last_checked": now(), "result": LABEL[status]}
             if status in ("sold", "deleted"):
-                token = token or get_access_token()
                 ok, msg = stop_on_ebay(r["ebay_item_id"], token)
                 upd["result"] = f"{LABEL[status]} → {msg}"
                 if ok:
