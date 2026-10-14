@@ -200,16 +200,27 @@ def guess_query(title):
     t = unicodedata.normalize("NFKC", title or "")
     for m in MODEL_RE.finditer(t):
         code = m.group(1)
-        if re.search(r"[A-Za-z]", code) and re.search(r"\d", code) and len(code) >= 4:
+        if re.search(r"[A-Za-z]", code) and len(re.findall(r"\d", code)) >= 2 and len(code.replace("-", "")) >= 4:
             return code
     return ""
 
 
+_market_cache = {}
+
+
 def ebay_market_usd(query):
-    """eBay(US)で同じ型番の中古・即決出品の価格(送料込み)の中央値と件数"""
+    """eBay(US)で同じ型番の中古・即決出品の価格(送料込み)の中央値と件数（携帯電話カテゴリ）"""
+    if query in _market_cache:
+        return _market_cache[query]
+    _market_cache[query] = _ebay_market_usd(query)
+    return _market_cache[query]
+
+
+def _ebay_market_usd(query):
     r = requests.get(
         "https://api.ebay.com/buy/browse/v1/item_summary/search",
-        params={"q": query, "filter": "buyingOptions:{FIXED_PRICE},conditions:{USED}", "limit": 50},
+        params={"q": query, "category_ids": "9355",
+                "filter": "buyingOptions:{FIXED_PRICE},conditions:{USED}", "limit": 50},
         headers={"Authorization": f"Bearer {app_token()}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
         timeout=30,
     )
@@ -346,9 +357,86 @@ def research_row(r, info, settings):
     return out
 
 
+# ---------- 自動仕入れ候補さがし ----------
+SEARCH_JS = """async () => {
+    for (let i = 0; i < 5; i++) { window.scrollBy(0, 2000); await new Promise(r => setTimeout(r, 1200)); }
+    return [...document.querySelectorAll('a[href*="/item/m"], a[href*="/shops/product/"]')]
+        .filter(a => !a.getAttribute('href').includes('ad_id'))   // 広告枠は除く
+        .map(a => {
+            const img = a.querySelector('img');
+            const m = a.innerText.match(/([\\d,]+)/);
+            return { url: 'https://jp.mercari.com' + a.getAttribute('href').split('?')[0],
+                     title: img ? img.alt.replace(/のサムネイル$/, '') : '',
+                     price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null };
+        });
+}"""
+
+
+def discover():
+    data = sheet("list")
+    settings = data.get("settings", {})
+    known = {r["mercari_url"].split("?")[0] for r in data["rows"]}
+    keywords = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "ガラケー")) if k.strip()]
+    min_margin = float(settings.get("min_margin") or 20)
+    min_profit = float(settings.get("min_profit") or 1500)
+    max_add = int(float(settings.get("max_add") or 5))
+    exclude = [w.strip() for w in re.split(r"[,、\n]", str(settings.get("exclude") or "")) if w.strip()]
+
+    found, seen, checked = [], set(), 0
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(locale="ja-JP", user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
+        for kw in keywords:
+            url = ("https://jp.mercari.com/search?status=on_sale&sort=created_time&order=desc"
+                   "&category_id=860&keyword=" + requests.utils.quote(kw))   # 携帯電話本体カテゴリ
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_selector('a[href*="/item/m"], a[href*="/shops/product/"]', timeout=25000)
+                items = page.evaluate(SEARCH_JS)
+            except Exception:
+                continue
+            for it in items:
+                u = it["url"]
+                if u in known or u in seen or not it["price"]:
+                    continue
+                seen.add(u)
+                if any(w in it["title"] for w in exclude):
+                    continue
+                q = guess_query(it["title"])
+                if not q:
+                    continue
+                checked += 1
+                sale, n = ebay_market_usd(q)
+                if not sale or n < 3:          # 比較できる出品が少ないものは信用しない
+                    continue
+                p, rate = profit(it["price"], sale, settings)
+                if rate >= min_margin and p >= min_profit:
+                    found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
+                                  "ebay_usd": sale, "ebay_count": n, "query": q,
+                                  "profit": p, "margin": rate, "memo": "自動発見",
+                                  "result": f"自動発見 {now()}"})
+            time.sleep(random.uniform(8, 15))
+        browser.close()
+
+    found.sort(key=lambda x: x["profit"], reverse=True)
+    added = found[:max_add]
+    if added:
+        sheet("append", rows=added)
+        best = added[0]
+        notify(f"【仕入れ候補】{len(added)}件を追加しました。最高：{best['title'][:30]} 想定利益 {best['profit']:,}円（{best['margin']}%）")
+    msg = f"{now()} 候補さがし：{checked}件を計算、条件に合う{len(found)}件のうち{len(added)}件を追加"
+    print(msg)
+    sheet("log", message=msg)
+
+
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) > 1 and sys.argv[1] == "discover":
+            discover()
+        else:
+            main()
     except Exception as e:
         notify(f"【エラー】監視中に問題が起きました: {e}")
         print("エラーが起きました（詳細はスプレッドシートの「設定」シートを確認）:", type(e).__name__)
