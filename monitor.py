@@ -8,8 +8,11 @@ import base64
 import json
 import os
 import random
+import re
+import statistics
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -141,11 +144,11 @@ def check_mercari(page, url):
     try:
         resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
     except Exception:
-        return "unknown"
+        return "unknown", {}
     if resp is not None and resp.status == 404:
-        return "deleted"
+        return "deleted", {}
     if resp is not None and resp.status in (403, 429):
-        return "blocked"
+        return "blocked", {}
     try:
         page.wait_for_function(
             """() => { const t = document.body ? document.body.innerText : '';
@@ -153,9 +156,99 @@ def check_mercari(page, url):
             timeout=25000,
         )
     except Exception:
-        return "unknown"
+        return "unknown", {}
     page.wait_for_timeout(1500)
-    return page.evaluate(JUDGE_JS)
+    status = page.evaluate(JUDGE_JS)
+    info = page.evaluate(INFO_JS) if status in ("on_sale", "sold") else {}
+    return status, info
+
+
+INFO_JS = """() => {
+    const title = (document.querySelector('h1')?.innerText || document.title.replace(/ - メルカリ.*$/, '')).trim();
+    const main = (document.querySelector('main') || document.body).innerText;
+    const head = main.split('商品の説明')[0];
+    const m = head.match(/¥\\s*([\\d,]+)/);
+    return { title, price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null };
+}"""
+
+# ---------- 仕入れ候補の利益計算 ----------
+_app_token = None
+
+
+def app_token():
+    """出品者の権限が要らない検索用のトークン"""
+    global _app_token
+    if _app_token:
+        return _app_token
+    auth = "Basic " + base64.b64encode(f"{APP_ID}:{CERT_ID}".encode()).decode()
+    r = requests.post(
+        TOKEN_URL,
+        headers={"Authorization": auth, "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    _app_token = r.json()["access_token"]
+    return _app_token
+
+
+MODEL_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}-?\d{2,4}[A-Za-z]{0,2})(?![A-Za-z0-9])")
+
+
+def guess_query(title):
+    """商品名から型番らしき文字列を拾う（例：KY-42C、SH-02L、SO903i）"""
+    t = unicodedata.normalize("NFKC", title or "")
+    for m in MODEL_RE.finditer(t):
+        code = m.group(1)
+        if re.search(r"[A-Za-z]", code) and re.search(r"\d", code) and len(code) >= 4:
+            return code
+    return ""
+
+
+def ebay_market_usd(query):
+    """eBay(US)で同じ型番の中古・即決出品の価格(送料込み)の中央値と件数"""
+    r = requests.get(
+        "https://api.ebay.com/buy/browse/v1/item_summary/search",
+        params={"q": query, "filter": "buyingOptions:{FIXED_PRICE},conditions:{USED}", "limit": 50},
+        headers={"Authorization": f"Bearer {app_token()}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    prices = []
+    for it in r.json().get("itemSummaries", []):
+        try:
+            p = float(it["price"]["value"])
+            ship = it.get("shippingOptions", [{}])[0].get("shippingCost", {}).get("value")
+            prices.append(p + (float(ship) if ship else 0))
+        except (KeyError, ValueError, IndexError):
+            continue
+    if not prices:
+        return None, 0
+    return round(statistics.median(prices), 2), len(prices)
+
+
+_fx = None
+
+
+def usd_jpy(settings):
+    global _fx
+    manual = str(settings.get("fx") or "").strip()
+    if manual:
+        return float(manual)
+    if _fx is None:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=30)
+        r.raise_for_status()
+        _fx = float(r.json()["rates"]["JPY"])
+    return _fx
+
+
+def profit(cost_jpy, sale_usd, settings):
+    fx = usd_jpy(settings)
+    fee = float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)
+    ship = float(settings.get("ship_jpy") or 3000)
+    revenue = sale_usd * fx
+    p = revenue * (1 - fee / 100) - ship - cost_jpy
+    return round(p), (round(p / revenue * 100, 1) if revenue else 0)
 
 
 LABEL = {"on_sale": "販売中", "sold": "売り切れ", "deleted": "削除・非公開",
@@ -163,16 +256,19 @@ LABEL = {"on_sale": "販売中", "sold": "売り切れ", "deleted": "削除・�
 
 
 def main():
-    rows = sheet("list")["rows"]
+    data = sheet("list")
+    rows, settings = data["rows"], data.get("settings", {})
     targets = [r for r in rows if r["status"] in ("", "active")]
-    print(f"{now()} チェック対象: {len(targets)}件")
+    watch = [r for r in targets if r["ebay_item_id"]]
+    research = [r for r in targets if not r["ebay_item_id"]]
+    print(f"{now()} 監視 {len(watch)}件／仕入れ候補 {len(research)}件")
     if not targets:
-        sheet("log", message=f"{now()} 正常終了：監視中の商品なし")
+        sheet("log", message=f"{now()} 正常終了：対象の商品なし")
         return
 
     # eBayの認証を最初に確認しておく（売り切れを見つけてから失敗するのを防ぐ）
-    token = get_access_token()
-    updates, blocked, counts, stopped = [], 0, {}, 0
+    token = get_access_token() if watch else None
+    updates, blocked, counts, stopped, researched = [], 0, {}, 0, 0
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(
@@ -181,19 +277,34 @@ def main():
                         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
         )
         for r in targets:
-            status = check_mercari(page, r["mercari_url"])
+            status, info = check_mercari(page, r["mercari_url"])
             counts[status] = counts.get(status, 0) + 1
             upd = {"row": r["row"], "last_checked": now(), "result": LABEL[status]}
-            if status in ("sold", "deleted"):
-                ok, msg = stop_on_ebay(r["ebay_item_id"], token)
-                upd["result"] = f"{LABEL[status]} → {msg}"
-                if ok:
+
+            if r["ebay_item_id"]:
+                # ---- 出品中の商品：売り切れたらeBayを止める ----
+                if status in ("sold", "deleted"):
+                    ok, msg = stop_on_ebay(r["ebay_item_id"], token)
+                    upd["result"] = f"{LABEL[status]} → {msg}"
+                    if ok:
+                        upd["status"] = "stopped"
+                        stopped += 1
+                        notify(f"【停止】{r.get('memo','')} メルカリ{LABEL[status]} → {msg}（eBay {r['ebay_item_id']}）")
+                    else:
+                        notify(f"【要対応】{r.get('memo','')} メルカリ{LABEL[status]}ですが{msg}（eBay {r['ebay_item_id']}）")
+            else:
+                # ---- 仕入れ候補：商品名・価格・相場・利益を埋める ----
+                if status in ("sold", "deleted"):
+                    upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
-                    stopped += 1
-                    notify(f"【停止】{r.get('memo','')} メルカリ{LABEL[status]} → {msg}（eBay {r['ebay_item_id']}）")
-                else:
-                    notify(f"【要対応】{r.get('memo','')} メルカリ{LABEL[status]}ですが{msg}（eBay {r['ebay_item_id']}）")
-            elif status == "blocked":
+                elif status == "on_sale" and info:
+                    try:
+                        upd.update(research_row(r, info, settings))
+                        researched += 1
+                    except Exception as e:
+                        upd["result"] = f"販売中（相場の取得に失敗：{str(e)[:60]}）"
+
+            if status == "blocked":
                 blocked += 1
             elif status == "unknown":
                 notify(f"【確認して】メルカリの状態を判定できませんでした：{r['mercari_url']}")
@@ -206,8 +317,33 @@ def main():
         notify(f"【注意】メルカリにアクセスを拒否されました（{blocked}件）。クラウドからのアクセスが制限されている可能性があります。")
     # 記録には件数だけを出す（URLや出品番号は出さない）
     summary = "、".join(f"{LABEL[k]} {v}件" for k, v in counts.items())
-    print(f"{now()} 完了：{summary}／eBay停止 {stopped}件")
-    sheet("log", message=f"{now()} 正常終了：{summary}／eBay停止 {stopped}件")
+    msg = f"{now()} 正常終了：{summary}／eBay停止 {stopped}件／利益計算 {researched}件"
+    print(msg)
+    sheet("log", message=msg)
+
+
+def research_row(r, info, settings):
+    out = {"title": info.get("title") or r.get("title", "")}
+    cost = info.get("price")
+    if cost:
+        out["cost"] = cost
+    query = (r.get("query") or "").strip() or guess_query(out["title"])
+    out["query"] = query
+    sale = r.get("ebay_usd")
+    if not sale and query:
+        sale, n = ebay_market_usd(query)
+        out["ebay_usd"] = sale or ""
+        out["ebay_count"] = n
+    if not query:
+        out["result"] = "販売中（型番が見つからず相場不明。検索語の列に型番を入れてください）"
+    elif not sale:
+        out["result"] = "販売中（eBayに同じ型番の出品が見つかりません）"
+    elif cost:
+        p, rate = profit(cost, float(sale), settings)
+        out["profit"] = p
+        out["margin"] = rate
+        out["result"] = "販売中"
+    return out
 
 
 if __name__ == "__main__":
