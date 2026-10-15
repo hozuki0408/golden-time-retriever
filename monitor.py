@@ -162,7 +162,7 @@ def check_mercari(page, url):
         )
     except Exception:
         return "unknown", {}
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(600)
     status = page.evaluate(JUDGE_JS)
     info = page.evaluate(INFO_JS) if status in ("on_sale", "sold") else {}
     return status, info
@@ -312,8 +312,15 @@ def main():
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
         )
+        # 高速化：画像・動画・フォントは読み込まない（判定に不要。写真のURLはページ内に残る）
+        page.route("**/*", lambda route: route.abort()
+                   if route.request.resource_type in ("image", "media", "font") else route.continue_())
         for r in targets:
-            status, info = check_mercari(page, r["mercari_url"])
+            yahoo = is_yahoo(r["mercari_url"])
+            if yahoo:
+                status, info, ydetail = check_yahoo(r["mercari_url"])
+            else:
+                status, info = check_mercari(page, r["mercari_url"])
             counts[status] = counts.get(status, 0) + 1
             upd = {"row": r["row"], "last_checked": now(), "result": LABEL[status]}
 
@@ -361,7 +368,7 @@ def main():
                     # ---- 「出品する」にチェック：eBayに出品 ----
                     try:
                         token = token or get_access_token()
-                        detail = page.evaluate(DETAIL_JS)
+                        detail = ydetail if yahoo else page.evaluate(DETAIL_JS)
                         res, err = create_listing(r, info, detail, settings, token)
                     except Exception as e:
                         res, err = None, f"出品中にエラー：{str(e)[:200]}"
@@ -396,9 +403,12 @@ def main():
             if status == "blocked":
                 blocked += 1
             elif status == "unknown":
-                notify(f"【確認して】メルカリの状態を判定できませんでした：{r['mercari_url']}")
+                notify(f"【確認して】商品ページの状態を判定できませんでした：{r['mercari_url']}")
             updates.append(upd)
-            time.sleep(random.uniform(6, 12))
+            if len(updates) >= 10:   # 途中で止まっても結果が残るよう、10件ごとにシートへ書く
+                sheet("update", updates=updates)
+                updates = []
+            time.sleep(random.uniform(0.5, 1.5) if yahoo else random.uniform(1.5, 3))
         browser.close()
 
     sheet("update", updates=updates)
@@ -655,6 +665,61 @@ SEARCH_JS = """async () => {
 }"""
 
 
+# ---------- Yahoo!フリマ（旧PayPayフリマ） ----------
+YAHOO_API = "https://paypayfleamarket.yahoo.co.jp/api"
+YAHOO_HEADERS = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                 "Accept": "application/json", "Referer": "https://paypayfleamarket.yahoo.co.jp/"}
+YAHOO_PHONE_CATEGORY = 38419   # 携帯電話本体
+
+
+def is_yahoo(url):
+    return "paypayfleamarket.yahoo.co.jp/item/" in url
+
+
+def yahoo_item(url):
+    item_id = url.rstrip("/").split("/item/")[-1].split("?")[0]
+    r = requests.get(f"{YAHOO_API}/item/v2/items/{item_id}", headers=YAHOO_HEADERS, timeout=30)
+    return r.status_code, (r.json() if r.status_code == 200 else {})
+
+
+def check_yahoo(url):
+    """メルカリの check_mercari と同じ形 (status, info, detail) を返す"""
+    try:
+        code, j = yahoo_item(url)
+    except Exception:
+        return "unknown", {}, {}
+    if code == 404:
+        return "deleted", {}, {}
+    if code in (403, 429):
+        return "blocked", {}, {}
+    if code != 200:
+        return "unknown", {}, {}
+    st = j.get("status")
+    status = "on_sale" if st == "OPEN" else "sold" if st in ("SOLD", "CLOSED") else "unknown"
+    info = {"title": j.get("title", ""), "price": j.get("price")}
+    detail = {"images": [i.get("url") for i in j.get("images", []) if i.get("url")][:12],
+              "description": j.get("description", ""),
+              "condition": (j.get("condition") or {}).get("text", "")}
+    return status, info, detail
+
+
+def yahoo_search(keyword):
+    r = requests.get(f"{YAHOO_API}/v1/search", headers=YAHOO_HEADERS, timeout=30,
+                     params={"query": keyword, "results": 100, "sort": "price", "order": "asc",
+                             "itemStatus": "open"})
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("items", []):
+        if (it.get("category") or {}).get("id") != YAHOO_PHONE_CATEGORY:
+            continue          # 携帯電話本体以外（電池・ケースなど）は除く
+        if it.get("condition") == "used80":
+            continue          # 全体的に状態が悪い
+        out.append({"url": f"https://paypayfleamarket.yahoo.co.jp/item/{it['id']}",
+                    "title": it.get("title", ""), "price": it.get("price")})
+    return out
+
+
 def discover():
     data = sheet("list")
     settings = data.get("settings", {})
@@ -699,6 +764,31 @@ def discover():
                     found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
                                   "ebay_usd": sale, "ebay_count": n, "query": q,
                                   "profit": p, "margin": rate, "memo": "自動発見",
+                                  "result": f"自動発見 {now()}"})
+            # Yahoo!フリマも同じキーワードで探す
+            try:
+                yitems = yahoo_search(kw)
+            except Exception:
+                yitems = []
+            for it in yitems:
+                u = it["url"]
+                if u in known or u in seen or not it["price"]:
+                    continue
+                seen.add(u)
+                if any(w in it["title"] for w in exclude):
+                    continue
+                q = guess_query(it["title"])
+                if not q:
+                    continue
+                checked += 1
+                sale, n = ebay_market_usd(q)
+                if not sale or n < MIN_COUNT:
+                    continue
+                p, rate = profit(it["price"], sale, settings)
+                if rate >= min_margin and p >= min_profit:
+                    found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
+                                  "ebay_usd": sale, "ebay_count": n, "query": q,
+                                  "profit": p, "margin": rate, "memo": "自動発見（Yahoo!フリマ）",
                                   "result": f"自動発見 {now()}"})
             time.sleep(random.uniform(8, 15))
         browser.close()
