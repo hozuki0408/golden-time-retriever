@@ -218,9 +218,24 @@ def app_token():
 MODEL_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}-?\d{2,4}[A-Za-z]{0,2})(?![A-Za-z0-9])")
 
 
+KNOWN_MODELS = []   # 設定シートの検索キーワード（型番）。商品名にあればそれを優先
+DIGIT_MODEL_RE = re.compile(r"(?<![A-Za-z0-9])(A?\d{3}(?:KC|SH))(?![A-Za-z0-9])", re.I)   # 903KC・602SH・A203KC など
+
+
+def _flat(s):
+    return re.sub(r"[-\s‐－ー]", "", unicodedata.normalize("NFKC", s or "")).upper()
+
+
 def guess_query(title):
-    """商品名から型番らしき文字列を拾う（例：KY-42C、SH-02L、SO903i）"""
+    """商品名から型番らしき文字列を拾う（例：KY-42C、SH-02L、903KC、SO903i）"""
     t = unicodedata.normalize("NFKC", title or "")
+    ft = _flat(t)
+    for k in KNOWN_MODELS:
+        if len(_flat(k)) >= 4 and _flat(k) in ft:
+            return k
+    m = DIGIT_MODEL_RE.search(t)
+    if m:
+        return m.group(1).upper()
     for m in MODEL_RE.finditer(t):
         code = m.group(1)
         if re.search(r"[A-Za-z]", code) and len(re.findall(r"\d", code)) >= 2 and len(code.replace("-", "")) >= 4:
@@ -305,6 +320,7 @@ MIN_COUNT = 10   # eBayの相場の件数がこれ未満の機種は候補にし
 def main():
     data = sheet("list")
     rows, settings = data["rows"], data.get("settings", {})
+    KNOWN_MODELS[:] = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "")) if k.strip()]
     targets = [r for r in rows if r["status"] in ("", "active")]
     watch = [r for r in targets if r["ebay_item_id"]]
     research = [r for r in targets if not r["ebay_item_id"]]
@@ -510,6 +526,7 @@ SERIES = {
     "A206SH": "Sharp AQUOS Keitai 4", "SH-01J": "Sharp AQUOS Keitai", "SH-02L": "Sharp AQUOS Keitai",
     "SH-02K": "Sharp AQUOS Keitai", "F-01G": "Fujitsu Raku-Raku Phone", "F-03L": "Fujitsu Raku-Raku Phone",
     "P-01G": "Panasonic", "P-01H": "Panasonic", "P-01J": "Panasonic",
+    "903KC": "Kyocera DIGNO Keitai", "A203KC": "Kyocera DIGNO Keitai", "602SH": "Sharp AQUOS Keitai",
 }
 
 
@@ -736,6 +753,7 @@ def discover():
     settings = data.get("settings", {})
     known = {r["mercari_url"].split("?")[0] for r in data["rows"]}
     keywords = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "ガラケー")) if k.strip()]
+    KNOWN_MODELS[:] = keywords
     min_margin = float(settings.get("min_margin") or 20)
     min_profit = float(settings.get("min_profit") or 1500)
     max_add = int(float(settings.get("max_add") or 5))
