@@ -334,6 +334,14 @@ def main():
                         target, floor = market_price_usd(info["price"], (r.get("query") or "").strip(), settings)
                         if target is not None:
                             new_price = max(target, floor)
+                            # 実際の出品価格で売れたときの利益をシートに書く
+                            fx = usd_jpy(settings)
+                            fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+                            rev = new_price * fx
+                            p = rev * (1 - fee) - float(settings.get("ship_jpy") or 3000) - info["price"]
+                            upd["cost"] = info["price"]
+                            upd["profit"] = round(p)
+                            upd["margin"] = round(p / rev * 100, 1) if rev else 0
                             if f"${new_price:.2f}" in (r.get("result") or ""):   # 値段が同じなら何もしない
                                 upd["result"] = r["result"]
                             else:
