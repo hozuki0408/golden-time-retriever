@@ -184,6 +184,7 @@ DETAIL_JS = """() => ({
               .filter((v, i, a) => v && a.indexOf(v) === i).slice(0, 12),
     description: (document.querySelector('[data-testid="description"]') || {}).innerText || '',
     condition: ((document.querySelector('[data-testid="商品の状態"]') || {}).innerText || '').split('\\n')[0],
+    category: [...document.querySelectorAll('a[href*="category_id="]')].map(a => a.innerText.trim()).filter(Boolean).join(' > '),
 })"""
 
 INFO_JS = """() => {
@@ -231,7 +232,9 @@ def guess_query(title):
     t = unicodedata.normalize("NFKC", title or "")
     ft = _flat(t)
     for k in KNOWN_MODELS:
-        if len(_flat(k)) >= 4 and _flat(k) in ft:
+        fk = _flat(k)
+        # 前後が英数字でないときだけ一致（「RTCL805SH」のような別商品の品番を型番と間違えない）
+        if len(fk) >= 4 and re.search(r"(?<![A-Z0-9])" + re.escape(fk) + r"(?![A-Z0-9])", ft):
             return k
     m = DIGIT_MODEL_RE.search(t)
     if m:
@@ -620,13 +623,46 @@ def trading_call_root(call_name, body_xml, token):
     return ack, errors, root
 
 
-def create_listing(r, info, detail, settings, token):
+# eBayの「eBay外での取引」ポリシー違反を防ぐ：説明文からURL・連絡先・他サイトの話を消す
+RISKY_LINE = re.compile(r"メルカリ|ﾒﾙｶﾘ|ヤフオク|ヤフー|Yahoo|PayPay|ペイペイ|ラクマ|Amazon|アマゾン|楽天|ジモティ|"
+                        r"ショップ|店舗|オンラインストア|ストア|ホームページ|HP|サイト|LINE|ライン|Instagram|インスタ|"
+                        r"Twitter|ツイッター|Facebook|TikTok|YouTube|プロフ|他にも|他の出品|出品中|同時出品|専用|"
+                        r"コメント|いいね|即購入|値下げ|交渉|フォロー|#|＃|連絡|問い合わせ|お問合せ|電話|メール|"
+                        r"mercari|rakuma|shop|store|http|www\.|@", re.I)
+URL_RE = re.compile(r"https?://\S+|www\.\S+|[\w.-]+\.(?:com|jp|net|org|shop|me|info|biz)\S*|[\w.+-]+@[\w-]+\.[\w.]+|"
+                    r"0\d{1,4}[-‐ー−]?\d{1,4}[-‐ー−]?\d{3,4}", re.I)
+
+
+def clean_desc(text):
+    lines = []
+    for ln in unicodedata.normalize("NFKC", text or "").splitlines():
+        if RISKY_LINE.search(ln):
+            continue
+        ln = URL_RE.sub("", ln).strip()
+        if ln:
+            lines.append(ln)
+    return "\n".join(lines)[:1500]
+
+
+PHONE_CATEGORY = re.compile(r"携帯電話本体|スマートフォン本体|PHS本体")
+
+
+def not_a_phone(r, title_jp, detail):
+    """仕入れ先の商品が携帯電話本体でなさそうなら理由を返す（CDの品番を型番と間違えた、など）"""
+    cat = detail.get("category", "")
+    if cat and not PHONE_CATEGORY.search(cat):
+        return f"携帯電話本体ではない商品です（カテゴリ：{cat[:40]}）"
+    q = _flat((r.get("query") or "").strip())
+    if len(q) >= 4:
+        hay = _flat(title_jp + " " + detail.get("description", ""))
+        if not re.search(r"(?<![A-Z0-9])" + re.escape(q) + r"(?![A-Z0-9])", hay):
+            return f"商品名・説明に型番 {r.get('query')} がありません"
+    return ""
+
+
+def prepare_text(r, info, detail):
+    """出品に使う英語タイトル・説明文など（新規出品と説明文の作り直しで共通）"""
     title_jp = info.get("title") or r.get("title", "")
-    cost = info.get("price")
-    if not cost:
-        return None, "価格が読み取れないため出品できません"
-    if not settings.get("ship_profile"):
-        return None, "「設定」シートに配送ポリシー名が入っていません"
     model = (r.get("query") or "").strip() or guess_query(title_jp) or ""
     text = title_jp + "\n" + detail.get("description", "")
     unlocked = bool(re.search(r"SIM\s*(フリー|ロック解除)|ロック解除済", unicodedata.normalize("NFKC", text), re.I))
@@ -634,9 +670,34 @@ def create_listing(r, info, detail, settings, token):
     color = next((en for jp, en in COLORS.items() if jp in title_jp), "") or \
         next((en for jp, en in COLORS.items() if jp in detail.get("description", "")), "")
     title_en = build_title(model, title_jp, carrier, unlocked, color)
+    tr = sheet("translate", texts=[detail.get("condition", ""), clean_desc(detail.get("description", ""))])["texts"]
+    cond_en, desc_en = tr[0], clean_desc(tr[1])
+    desc_html = (
+        f"<h2>{escape(title_en)}</h2>"
+        f"<p><b>Model:</b> {escape(model)}<br><b>Carrier:</b> {escape(carrier or 'See description')}<br>"
+        f"<b>SIM lock:</b> {'Unlocked' if unlocked else 'Not stated by the original seller. Please check compatibility before purchase.'}<br>"
+        f"<b>Condition:</b> {escape(cond_en)}</p>"
+        "<p>Japanese mobile phone (keitai). Only the items shown in the photos are included. "
+        "Please make sure the phone supports your carrier's network bands before purchasing.</p>"
+        + (f"<h3>Notes from the original Japanese description (machine translated)</h3><p>{escape(desc_en).replace(chr(10), '<br>')}</p>" if desc_en else "")
+        + "<p>Ships from Japan. Thank you for looking!</p>")
+    return {"title_jp": title_jp, "model": model, "unlocked": unlocked, "carrier": carrier, "color": color,
+            "title_en": title_en, "cond_en": cond_en, "desc_html": desc_html}
 
-    tr = sheet("translate", texts=[detail.get("condition", ""), detail.get("description", "")[:3000]])["texts"]
-    cond_en, desc_en = tr[0], tr[1]
+
+def create_listing(r, info, detail, settings, token):
+    title_jp = info.get("title") or r.get("title", "")
+    cost = info.get("price")
+    if not cost:
+        return None, "価格が読み取れないため出品できません"
+    if not settings.get("ship_profile"):
+        return None, "「設定」シートに配送ポリシー名が入っていません"
+    bad = not_a_phone(r, title_jp, detail)
+    if bad:
+        return None, f"SKIP:{bad}のため出品しません"
+    t = prepare_text(r, info, detail)
+    model, unlocked, carrier, color, title_en, cond_en, desc_html = (
+        t["model"], t["unlocked"], t["carrier"], t["color"], t["title_en"], t["cond_en"], t["desc_html"])
     target, floor = market_price_usd(cost, model, settings)
     if target is None:
         return None, "SKIP:eBayの相場が取れないため出品しません"
@@ -655,15 +716,6 @@ def create_listing(r, info, detail, settings, token):
     # eBay必須：Color と Storage Capacity
     specifics.append(("Color", color or "As Pictured"))
     specifics.append(("Storage Capacity", storage_of(model)))
-    desc_html = (
-        f"<h2>{escape(title_en)}</h2>"
-        f"<p><b>Model:</b> {escape(model)}<br><b>Carrier:</b> {escape(carrier or 'See description')}<br>"
-        f"<b>SIM lock:</b> {'Unlocked' if unlocked else 'Not stated by the original seller. Please check compatibility before purchase.'}<br>"
-        f"<b>Condition:</b> {escape(cond_en)}</p>"
-        "<p>Japanese mobile phone (keitai). Only the items shown in the photos are included. "
-        "Please make sure the phone supports your carrier's network bands before purchasing.</p>"
-        f"<h3>Notes from the original Japanese description (machine translated)</h3><p>{escape(desc_en).replace(chr(10), '<br>')}</p>"
-        "<p>Ships from Japan. Thank you for looking!</p>")
     nvl = "".join(f"<NameValueList><Name>{escape(n)}</Name><Value>{escape(v)}</Value></NameValueList>" for n, v in specifics)
     sku = re.sub(r"[^A-Za-z0-9]", "", r["mercari_url"].rstrip("/").split("/")[-1])[:50]
     item = (
@@ -741,7 +793,9 @@ def check_yahoo(url):
     info = {"title": j.get("title", ""), "price": j.get("price")}
     detail = {"images": [i.get("url") for i in j.get("images", []) if i.get("url")][:12],
               "description": j.get("description", ""),
-              "condition": (j.get("condition") or {}).get("text", "")}
+              "condition": (j.get("condition") or {}).get("text", ""),
+              "category": " > ".join(c.get("name", "") for c in ((j.get("category") or {}).get("path") or []))
+                          or (j.get("category") or {}).get("name", "")}
     return status, info, detail
 
 
@@ -871,10 +925,64 @@ def discover():
     sheet("log", message=msg)
 
 
+def fixdesc():
+    """出品中の全商品：携帯電話本体でないものはeBayを終了、それ以外は説明文を安全なものに作り直す（1回だけ実行）"""
+    data = sheet("list")
+    settings = data.get("settings", {})
+    KNOWN_MODELS[:] = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "")) if k.strip()]
+    rows = [r for r in data["rows"] if r["ebay_item_id"] and r["status"] in ("", "active")]
+    token = get_access_token()
+    fixed = ended = failed = 0
+    updates = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(locale="ja-JP", user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
+        for r in rows:
+            try:
+                if is_yahoo(r["mercari_url"]):
+                    status, info, detail = check_yahoo(r["mercari_url"])
+                else:
+                    status, info = check_mercari(page, r["mercari_url"])
+                    detail = page.evaluate(DETAIL_JS) if status == "on_sale" else {}
+                if status != "on_sale" or not info:
+                    continue   # 売り切れ等は通常の監視で止まる
+                bad = not_a_phone(r, info.get("title", ""), detail)
+                if bad:
+                    ok, msg = stop_on_ebay(r["ebay_item_id"], token)
+                    updates.append({"row": r["row"], "status": "stopped" if ok else None,
+                                    "result": f"{bad}のためeBayを終了 → {msg}"})
+                    ended += ok
+                    continue
+                t = prepare_text(r, info, detail)
+                ack, errs, root = trading_call_root(
+                    "ReviseFixedPriceItem",
+                    f"<Item><ItemID>{r['ebay_item_id']}</ItemID><Description><![CDATA[{t['desc_html']}]]></Description></Item>",
+                    token)
+                if ack in ("Success", "Warning"):
+                    fixed += 1
+                else:
+                    failed += 1
+                    updates.append({"row": r["row"], "result": "説明文の修正に失敗：" + " / ".join(errs)[:200]})
+            except Exception as e:
+                failed += 1
+                print("説明文の修正でエラー:", r["row"], str(e)[:200])
+        browser.close()
+    updates = [{k: v for k, v in u.items() if v is not None} for u in updates]
+    if updates:
+        sheet("update", updates=updates)
+    msg = f"{now()} 説明文の作り直し：修正 {fixed}件／eBay終了 {ended}件／失敗 {failed}件"
+    print(msg)
+    sheet("log", message=msg)
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "discover":
             discover()
+        elif len(sys.argv) > 1 and sys.argv[1] == "fixdesc":
+            fixdesc()
         else:
             main()
     except Exception as e:
