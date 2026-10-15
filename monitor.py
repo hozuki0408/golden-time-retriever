@@ -411,7 +411,10 @@ def research_row(r, info, settings):
 BRANDS = [(r"^(KYF|KYV|KY-|KY)", "Kyocera"), (r"^(SHF|SHV|SH-|SH)", "Sharp"), (r"SH$", "Sharp"), (r"KC$", "Kyocera"),
           (r"^P-?\d", "Panasonic"), (r"^N-?\d", "NEC"), (r"^F-?\d", "Fujitsu"), (r"^SO-?\d", "Sony Ericsson"),
           (r"^CA-?\d", "Casio"), (r"^SA-?\d", "Sanyo"), (r"^D-?\d", "Mitsubishi"), (r"^L-?\d", "LG")]
-COLORS = {"ブラック": "Black", "黒": "Black", "ホワイト": "White", "白": "White", "ブルー": "Blue", "青": "Blue",
+COLORS = {"ブルーブラック": "Blue Black", "ワインレッド": "Red", "ボルドー": "Red", "ブラウン": "Brown", "茶": "Brown",
+          "ライトブルー": "Blue", "水色": "Blue", "ローズ": "Pink", "ベージュ": "Beige", "シャンパン": "Gold",
+          "black": "Black", "white": "White", "blue": "Blue", "red": "Red", "pink": "Pink", "silver": "Silver",
+          "ブラック": "Black", "黒": "Black", "ホワイト": "White", "白": "White", "ブルー": "Blue", "青": "Blue",
           "ネイビー": "Navy", "レッド": "Red", "赤": "Red", "ピンク": "Pink", "シルバー": "Silver", "ゴールド": "Gold",
           "グリーン": "Green", "緑": "Green", "パープル": "Purple", "オレンジ": "Orange", "イエロー": "Yellow", "グレー": "Gray"}
 
@@ -455,6 +458,19 @@ SERIES = {
     "SH-02K": "Sharp AQUOS Keitai", "F-01G": "Fujitsu Raku-Raku Phone", "F-03L": "Fujitsu Raku-Raku Phone",
     "P-01G": "Panasonic", "P-01H": "Panasonic", "P-01J": "Panasonic",
 }
+
+
+# 本体の内蔵メモリ（4Gガラホはほぼ8GB）
+STORAGE = {"F-01G": "Less than 1 GB", "F-08C": "Less than 1 GB", "P-01G": "Less than 1 GB"}
+
+
+def storage_of(model):
+    m = model.upper()
+    if m in STORAGE:
+        return STORAGE[m]
+    if re.match(r"^(\d{3}|A\d{3})(KC|SH)$|^KY-42C$|^KYF(3[1-9]|4\d)$|^SH-0[12][JKL]$|^SH-32C$|^SHF3\d$", m):
+        return "8 GB"
+    return "Less than 1 GB"
 
 
 def build_title(model, title, carrier, unlocked, color):
@@ -518,7 +534,8 @@ def create_listing(r, info, detail, settings, token):
     text = title_jp + "\n" + detail.get("description", "")
     unlocked = bool(re.search(r"SIM\s*(フリー|ロック解除)|ロック解除済", unicodedata.normalize("NFKC", text), re.I))
     carrier = carrier_of(model, text)
-    color = next((en for jp, en in COLORS.items() if jp in title_jp), "")
+    color = next((en for jp, en in COLORS.items() if jp in title_jp), "") or \
+        next((en for jp, en in COLORS.items() if jp in detail.get("description", "")), "")
     title_en = build_title(model, title_jp, carrier, unlocked, color)
 
     tr = sheet("translate", texts=[detail.get("condition", ""), detail.get("description", "")[:3000]])["texts"]
@@ -533,8 +550,9 @@ def create_listing(r, info, detail, settings, token):
                  ("Network", "Unlocked" if unlocked else (carrier or "Unknown")),
                  ("Lock Status", "Network Unlocked" if unlocked else "Network Locked" if carrier else "Unknown"),
                  ("Country of Origin", "Japan")]
-    if color:
-        specifics.append(("Color", color))
+    # eBay必須：Color と Storage Capacity
+    specifics.append(("Color", color or "As Pictured"))
+    specifics.append(("Storage Capacity", storage_of(model)))
     desc_html = (
         f"<h2>{escape(title_en)}</h2>"
         f"<p><b>Model:</b> {escape(model)}<br><b>Carrier:</b> {escape(carrier or 'See description')}<br>"
