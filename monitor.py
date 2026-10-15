@@ -13,7 +13,9 @@ import statistics
 import sys
 import time
 import unicodedata
+import math
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -163,6 +165,13 @@ def check_mercari(page, url):
     return status, info
 
 
+DETAIL_JS = """() => ({
+    images: [...document.querySelectorAll('[data-testid^="image-"] img')].map(i => i.currentSrc || i.src)
+              .filter((v, i, a) => v && a.indexOf(v) === i).slice(0, 12),
+    description: (document.querySelector('[data-testid="description"]') || {}).innerText || '',
+    condition: ((document.querySelector('[data-testid="商品の状態"]') || {}).innerText || '').split('\\n')[0],
+})"""
+
 INFO_JS = """() => {
     const title = (document.querySelector('h1')?.innerText || document.title.replace(/ - メルカリ.*$/, '')).trim();
     const main = (document.querySelector('main') || document.body).innerText;
@@ -253,7 +262,13 @@ def usd_jpy(settings):
     return _fx
 
 
+def adj(sale_usd, settings):
+    """出品中の価格は実際に売れる価格より高めなので、補正をかける"""
+    return float(sale_usd) * float(settings.get("market_adj") or 80) / 100
+
+
 def profit(cost_jpy, sale_usd, settings):
+    sale_usd = adj(sale_usd, settings)
     fx = usd_jpy(settings)
     fee = float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)
     ship = float(settings.get("ship_jpy") or 3000)
@@ -279,7 +294,7 @@ def main():
 
     # eBayの認証を最初に確認しておく（売り切れを見つけてから失敗するのを防ぐ）
     token = get_access_token() if watch else None
-    updates, blocked, counts, stopped, researched = [], 0, {}, 0, 0
+    updates, blocked, counts, stopped, researched, listed = [], 0, {}, 0, 0, 0
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(
@@ -308,6 +323,23 @@ def main():
                 if status in ("sold", "deleted"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
+                elif status == "on_sale" and info and r.get("list"):
+                    # ---- 「出品する」にチェック：eBayに出品 ----
+                    try:
+                        token = token or get_access_token()
+                        detail = page.evaluate(DETAIL_JS)
+                        res, err = create_listing(r, info, detail, settings, token)
+                    except Exception as e:
+                        res, err = None, f"出品中にエラー：{str(e)[:200]}"
+                    upd["list"] = False
+                    if res:
+                        upd["ebay_item_id"] = res["ebay_item_id"]
+                        upd["result"] = f"eBayに出品しました（${res['price']:.2f}）→ 売り切れ監視を開始"
+                        listed += 1
+                        notify(f"【出品】{res['title_en']} ${res['price']:.2f}（eBay {res['ebay_item_id']}）")
+                    else:
+                        upd["result"] = err
+                        notify(f"【出品できず】{info.get('title','')[:30]}：{err}")
                 elif status == "on_sale" and info:
                     try:
                         upd.update(research_row(r, info, settings))
@@ -328,7 +360,7 @@ def main():
         notify(f"【注意】メルカリにアクセスを拒否されました（{blocked}件）。クラウドからのアクセスが制限されている可能性があります。")
     # 記録には件数だけを出す（URLや出品番号は出さない）
     summary = "、".join(f"{LABEL[k]} {v}件" for k, v in counts.items())
-    msg = f"{now()} 正常終了：{summary}／eBay停止 {stopped}件／利益計算 {researched}件"
+    msg = f"{now()} 正常終了：{summary}／eBay停止 {stopped}件／利益計算 {researched}件／出品 {listed}件"
     print(msg)
     sheet("log", message=msg)
 
@@ -355,6 +387,152 @@ def research_row(r, info, settings):
         out["margin"] = rate
         out["result"] = "販売中"
     return out
+
+
+# ---------- eBayへの出品 ----------
+BRANDS = [(r"^(KYF|KYV|KY-|KY)", "Kyocera"), (r"^(SHF|SHV|SH-|SH)", "Sharp"), (r"SH$", "Sharp"), (r"KC$", "Kyocera"),
+          (r"^P-?\d", "Panasonic"), (r"^N-?\d", "NEC"), (r"^F-?\d", "Fujitsu"), (r"^SO-?\d", "Sony Ericsson"),
+          (r"^CA-?\d", "Casio"), (r"^SA-?\d", "Sanyo"), (r"^D-?\d", "Mitsubishi"), (r"^L-?\d", "LG")]
+COLORS = {"ブラック": "Black", "黒": "Black", "ホワイト": "White", "白": "White", "ブルー": "Blue", "青": "Blue",
+          "ネイビー": "Navy", "レッド": "Red", "赤": "Red", "ピンク": "Pink", "シルバー": "Silver", "ゴールド": "Gold",
+          "グリーン": "Green", "緑": "Green", "パープル": "Purple", "オレンジ": "Orange", "イエロー": "Yellow", "グレー": "Gray"}
+
+
+def brand_of(model, title):
+    m = model.upper()
+    for pat, name in BRANDS:
+        if re.search(pat, m):
+            return name
+    for name in ["Kyocera", "Sharp", "Panasonic", "NEC", "Fujitsu", "Sony", "Casio"]:
+        if name.lower() in title.lower():
+            return name
+    return "Unbranded"
+
+
+def carrier_of(model, text):
+    t = text.lower()
+    if "docomo" in t or "ドコモ" in text:
+        return "Docomo"
+    if re.search(r"(^|[^a-z])au([^a-z]|$)", t):
+        return "au"
+    if "softbank" in t or "ソフトバンク" in text:
+        return "SoftBank"
+    m = model.upper()
+    if re.match(r"^[A-Z]{1,2}-\d{2}[A-Z]$", m):
+        return "Docomo"
+    if re.match(r"^(KYF|SHF|KYV|SHV)", m):
+        return "au"
+    if re.match(r"^(A\d{3}|\d{3})[A-Z]{2}$", m):
+        return "SoftBank"
+    return ""
+
+
+def build_title(model, title, carrier, unlocked, color):
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", unicodedata.normalize("NFKC", title))
+             if w.upper() not in (model.upper().replace("-", ""), "SIM", "AU", "DOCOMO", "SOFTBANK", "USB", "TYPE")
+             and w.upper() != model.upper()][:3]
+    parts = [brand_of(model, title), *words, model, "Flip Phone", carrier,
+             "Unlocked" if unlocked else "", color, "Keitai Japan"]
+    t = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip()
+    return t[:80].rsplit(" ", 1)[0] if len(t) > 80 else t
+
+
+def list_price_usd(cost, settings):
+    fx = usd_jpy(settings)
+    fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+    margin = float(settings.get("target_margin") or 20) / 100
+    ship = float(settings.get("ship_jpy") or 3000)
+    revenue = (cost + ship) / max(0.05, 1 - fee - margin)
+    return math.ceil(revenue / fx) - 0.01
+
+
+def upload_pictures(urls, token):
+    out = []
+    for u in urls:
+        ack, errors, root = trading_call_root(
+            "UploadSiteHostedPictures",
+            f"<ExternalPictureURL>{escape(u)}</ExternalPictureURL><PictureSet>Supersize</PictureSet>", token)
+        full = root.findtext("e:SiteHostedPictureDetails/e:FullURL", default="", namespaces=NS)
+        if full:
+            out.append(full)
+    return out
+
+
+def trading_call_root(call_name, body_xml, token):
+    xml = ('<?xml version="1.0" encoding="utf-8"?>'
+           f'<{call_name}Request xmlns="urn:ebay:apis:eBLBaseComponents">{body_xml}</{call_name}Request>')
+    r = requests.post(TRADING_URL, headers={
+        "X-EBAY-API-CALL-NAME": call_name, "X-EBAY-API-SITEID": "0",
+        "X-EBAY-API-COMPATIBILITY-LEVEL": "1209", "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml"}, data=xml.encode("utf-8"), timeout=60)
+    root = ET.fromstring(r.content)
+    ack = root.findtext("e:Ack", default="", namespaces=NS)
+    errors = [e.findtext("e:LongMessage", default="", namespaces=NS)
+              for e in root.findall("e:Errors", NS) if e.findtext("e:SeverityCode", namespaces=NS) == "Error"]
+    return ack, errors, root
+
+
+def create_listing(r, info, detail, settings, token):
+    title_jp = info.get("title") or r.get("title", "")
+    cost = info.get("price")
+    if not cost:
+        return None, "価格が読み取れないため出品できません"
+    if not settings.get("ship_profile"):
+        return None, "「設定」シートに配送ポリシー名が入っていません"
+    model = (r.get("query") or "").strip() or guess_query(title_jp) or ""
+    text = title_jp + "\n" + detail.get("description", "")
+    unlocked = bool(re.search(r"SIM\s*(フリー|ロック解除)|ロック解除済", unicodedata.normalize("NFKC", text), re.I))
+    carrier = carrier_of(model, text)
+    color = next((en for jp, en in COLORS.items() if jp in title_jp), "")
+    title_en = build_title(model, title_jp, carrier, unlocked, color)
+
+    tr = sheet("translate", texts=[detail.get("condition", ""), detail.get("description", "")[:3000]])["texts"]
+    cond_en, desc_en = tr[0], tr[1]
+    price = list_price_usd(cost, settings)
+    pics = upload_pictures(detail.get("images", []), token)
+    if not pics:
+        return None, "画像をeBayにアップロードできませんでした"
+
+    cond_id = 1000 if "新品" in detail.get("condition", "") else 3000
+    specifics = [("Brand", brand_of(model, title_jp)), ("Model", model or "Not Specified"),
+                 ("Network", "Unlocked" if unlocked else (carrier or "Unknown")),
+                 ("Lock Status", "Network Unlocked" if unlocked else "Network Locked" if carrier else "Unknown"),
+                 ("Country of Origin", "Japan")]
+    if color:
+        specifics.append(("Color", color))
+    desc_html = (
+        f"<h2>{escape(title_en)}</h2>"
+        f"<p><b>Model:</b> {escape(model)}<br><b>Carrier:</b> {escape(carrier or 'See description')}<br>"
+        f"<b>SIM lock:</b> {'Unlocked' if unlocked else 'Not stated by the original seller. Please check compatibility before purchase.'}<br>"
+        f"<b>Condition:</b> {escape(cond_en)}</p>"
+        "<p>Japanese mobile phone (keitai). Only the items shown in the photos are included. "
+        "Please make sure the phone supports your carrier's network bands before purchasing.</p>"
+        f"<h3>Notes from the original Japanese description (machine translated)</h3><p>{escape(desc_en).replace(chr(10), '<br>')}</p>"
+        "<p>Ships from Japan. Thank you for looking!</p>")
+    nvl = "".join(f"<NameValueList><Name>{escape(n)}</Name><Value>{escape(v)}</Value></NameValueList>" for n, v in specifics)
+    sku = re.sub(r"[^A-Za-z0-9]", "", r["mercari_url"].rstrip("/").split("/")[-1])[:50]
+    item = (
+        f"<Item><Title>{escape(title_en)}</Title>"
+        f"<Description><![CDATA[{desc_html}]]></Description>"
+        "<PrimaryCategory><CategoryID>9355</CategoryID></PrimaryCategory>"
+        f'<StartPrice currencyID="USD">{price:.2f}</StartPrice>'
+        f"<ConditionID>{cond_id}</ConditionID>"
+        + (f"<ConditionDescription>{escape(cond_en[:900])}</ConditionDescription>" if cond_id != 1000 else "") +
+        "<Country>JP</Country><Location>Japan</Location><Currency>USD</Currency><Site>US</Site>"
+        "<ListingDuration>GTC</ListingDuration><ListingType>FixedPriceItem</ListingType><Quantity>1</Quantity>"
+        f"<SKU>{sku}</SKU>"
+        "<PictureDetails>" + "".join(f"<PictureURL>{escape(u)}</PictureURL>" for u in pics) + "</PictureDetails>"
+        f"<ItemSpecifics>{nvl}</ItemSpecifics>"
+        "<SellerProfiles>"
+        f"<SellerPaymentProfile><PaymentProfileName>{escape(str(settings.get('pay_profile') or 'Payment'))}</PaymentProfileName></SellerPaymentProfile>"
+        f"<SellerReturnProfile><ReturnProfileName>{escape(str(settings.get('return_profile') or 'Return'))}</ReturnProfileName></SellerReturnProfile>"
+        f"<SellerShippingProfile><ShippingProfileName>{escape(str(settings.get('ship_profile')))}</ShippingProfileName></SellerShippingProfile>"
+        "</SellerProfiles></Item>")
+    ack, errors, root = trading_call_root("AddFixedPriceItem", item, token)
+    item_id = root.findtext("e:ItemID", default="", namespaces=NS)
+    if ack in ("Success", "Warning") and item_id:
+        return {"ebay_item_id": item_id, "price": price, "title_en": title_en}, None
+    return None, "出品に失敗：" + " / ".join(errors)[:300]
 
 
 # ---------- 自動仕入れ候補さがし ----------
