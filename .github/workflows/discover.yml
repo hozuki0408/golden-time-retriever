@@ -2,11 +2,11 @@ name: 仕入れ候補さがし
 
 on:
   schedule:
-    - cron: "23 */3 * * *"   # 3時間ごと（メルカリに負担をかけないよう控えめ）
+    - cron: "23 * * * *"   # 1時間ごと（GitHubの混雑で数分〜十数分遅れることがあります）
   workflow_dispatch:
 
 concurrency:
-  group: monitor
+  group: discover   # 在庫監視とは別に動く（待たされない）
   cancel-in-progress: false
 
 permissions:
