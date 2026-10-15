@@ -227,14 +227,21 @@ def _flat(s):
     return re.sub(r"[-\s‐－ー]", "", unicodedata.normalize("NFKC", s or "")).upper()
 
 
+def has_model(text, model):
+    """文章に型番が含まれるか（KY42C・KY-42C・NP902KC・V602SH は一致、3902KC・0805SHISEIDO は不一致）"""
+    q = re.sub(r"[-\s‐－ー]", "", unicodedata.normalize("NFKC", model or "")).upper()
+    if len(q) < 4:
+        return False
+    pat = r"[-\s‐－ー]?".join(re.escape(c) for c in q)
+    t = unicodedata.normalize("NFKC", text or "").upper()
+    return re.search(r"(?<![0-9])" + pat + r"(?![A-Z0-9])", t) is not None
+
+
 def guess_query(title):
     """商品名から型番らしき文字列を拾う（例：KY-42C、SH-02L、903KC、SO903i）"""
     t = unicodedata.normalize("NFKC", title or "")
-    ft = _flat(t)
     for k in KNOWN_MODELS:
-        fk = _flat(k)
-        # 前後が英数字でないときだけ一致（「RTCL805SH」のような別商品の品番を型番と間違えない）
-        if len(fk) >= 4 and re.search(r"(?<![A-Z0-9])" + re.escape(fk) + r"(?![A-Z0-9])", ft):
+        if has_model(t, k):   # 「0805SHISEIDO」のような別商品の品番を型番と間違えない
             return k
     m = DIGIT_MODEL_RE.search(t)
     if m:
@@ -652,11 +659,11 @@ def not_a_phone(r, title_jp, detail):
     cat = detail.get("category", "")
     if cat and not PHONE_CATEGORY.search(cat):
         return f"携帯電話本体ではない商品です（カテゴリ：{cat[:40]}）"
-    q = _flat((r.get("query") or "").strip())
-    if len(q) >= 4:
-        hay = _flat(title_jp + " " + detail.get("description", ""))
-        if not re.search(r"(?<![A-Z0-9])" + re.escape(q) + r"(?![A-Z0-9])", hay):
-            return f"商品名・説明に型番 {r.get('query')} がありません"
+    if cat:
+        return ""   # カテゴリが携帯電話本体なら本体とみなす（型番が書かれていない出品もあるため）
+    q = (r.get("query") or "").strip()
+    if len(_flat(q)) >= 4 and not has_model(title_jp + " " + detail.get("description", ""), q):
+        return f"商品名・説明に型番 {q} がありません"
     return ""
 
 
@@ -977,11 +984,46 @@ def fixdesc():
     sheet("log", message=msg)
 
 
+def restore():
+    """型番チェックの不具合で止めてしまった出品を元に戻し、説明文を作り直す"""
+    data = sheet("list")
+    token = get_access_token()
+    rows = [r for r in data["rows"] if r["ebay_item_id"] and r["status"] == "stopped"
+            and re.search(r"型番 .+ がありませんのためeBayを終了", r.get("result") or "")]
+    updates, ok_n, relist_n, fail_n = [], 0, 0, 0
+    for r in rows:
+        ack, errs, root = trading_call_root(
+            "ReviseInventoryStatus",
+            f"<InventoryStatus><ItemID>{r['ebay_item_id']}</ItemID><Quantity>1</Quantity></InventoryStatus>", token)
+        if ack in ("Success", "Warning"):
+            ok_n += 1
+            updates.append({"row": r["row"], "status": "active", "result": "出品を元に戻しました（在庫1）"})
+            continue
+        ack2, errs2, root2 = trading_call_root(
+            "RelistFixedPriceItem", f"<Item><ItemID>{r['ebay_item_id']}</ItemID><Quantity>1</Quantity></Item>", token)
+        new_id = root2.findtext("e:ItemID", default="", namespaces=NS)
+        if ack2 in ("Success", "Warning") and new_id:
+            relist_n += 1
+            updates.append({"row": r["row"], "status": "active", "ebay_item_id": new_id,
+                            "result": f"再出品しました（新しい出品番号 {new_id}）"})
+        else:
+            fail_n += 1
+            updates.append({"row": r["row"], "result": "元に戻せませんでした：" + " / ".join(errs + errs2)[:200]})
+    if updates:
+        sheet("update", updates=updates)
+    msg = f"{now()} 出品の復元：在庫を戻した {ok_n}件／再出品 {relist_n}件／失敗 {fail_n}件"
+    print(msg)
+    sheet("log", message=msg)
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "discover":
             discover()
         elif len(sys.argv) > 1 and sys.argv[1] == "fixdesc":
+            fixdesc()
+        elif len(sys.argv) > 1 and sys.argv[1] == "restore":
+            restore()
             fixdesc()
         else:
             main()
