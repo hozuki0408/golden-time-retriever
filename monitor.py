@@ -130,6 +130,9 @@ def stop_on_ebay(item_id, token):
 JUDGE_JS = """() => {
     const text = document.body.innerText;
     if (/削除されています|見つかりません|公開停止/.test(text)) return 'deleted';
+    // メルカリオークションは仕入れ値が確定しないので対象外
+    if (document.querySelector('[data-testid="bid-button"], [data-testid="bid-button-container"]') ||
+        text.includes('オークション商品')) return 'auction';
     // メルカリShops: 在庫0でも非表示の「購入手続きへ」が残るため、専用の目印で判定
     if (document.querySelector('[data-testid="out-of-stock"], [data-testid="disabled-purchase-button"]'))
         return 'sold';
@@ -278,7 +281,9 @@ def profit(cost_jpy, sale_usd, settings):
 
 
 LABEL = {"on_sale": "販売中", "sold": "売り切れ", "deleted": "削除・非公開",
-         "unknown": "判定できず", "blocked": "メルカリにアクセスを拒否された"}
+         "unknown": "判定できず", "blocked": "メルカリにアクセスを拒否された",
+         "auction": "オークション商品"}
+MIN_COUNT = 10   # eBayの相場の件数がこれ未満の機種は候補にしない
 
 
 def main():
@@ -320,7 +325,7 @@ def main():
                         notify(f"【要対応】{r.get('memo','')} メルカリ{LABEL[status]}ですが{msg}（eBay {r['ebay_item_id']}）")
             else:
                 # ---- 仕入れ候補：商品名・価格・相場・利益を埋める ----
-                if status in ("sold", "deleted"):
+                if status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
                 elif status == "on_sale" and info and r.get("list"):
@@ -344,6 +349,13 @@ def main():
                     try:
                         upd.update(research_row(r, info, settings))
                         researched += 1
+                        # 利益が少ない・相場の件数が少ないものは候補から外す
+                        min_profit = float(settings.get("min_profit") or 2000)
+                        low_profit = "profit" in upd and upd["profit"] <= min_profit
+                        few = upd.get("ebay_count") not in (None, "") and int(upd["ebay_count"]) < MIN_COUNT
+                        if low_profit or few:
+                            upd["status"] = "stopped"
+                            upd["result"] = "利益が少ないため候補から外しました" if low_profit else "相場の件数が少ないため候補から外しました"
                     except Exception as e:
                         upd["result"] = f"販売中（相場の取得に失敗：{str(e)[:60]}）"
 
@@ -356,6 +368,10 @@ def main():
         browser.close()
 
     sheet("update", updates=updates)
+    try:
+        sheet("cleanup")   # 外した候補（eBay未出品）の行を削除
+    except Exception:
+        pass
     if blocked:
         notify(f"【注意】メルカリにアクセスを拒否されました（{blocked}件）。クラウドからのアクセスが制限されている可能性があります。")
     # 記録には件数だけを出す（URLや出品番号は出さない）
@@ -491,6 +507,8 @@ def create_listing(r, info, detail, settings, token):
     price = list_price_usd(cost, settings)
     pics = upload_pictures(detail.get("images", []), token)
     if not pics:
+        return None, "写真をeBayに取り込めなかったため出品を中止しました（もう一度チェックすると再挑戦します）"
+    if not pics:
         return None, "画像をeBayにアップロードできませんでした"
 
     cond_id = 1000 if "新品" in detail.get("condition", "") else 3000
@@ -543,7 +561,8 @@ SEARCH_JS = """async () => {
         .map(a => {
             const img = a.querySelector('img');
             const m = a.innerText.match(/([\\d,]+)/);
-            return { url: 'https://jp.mercari.com' + a.getAttribute('href').split('?')[0],
+            return { auction: /現在/.test(a.innerText),   // オークションは「現在 ¥◯◯」と表示される
+                     url: 'https://jp.mercari.com' + a.getAttribute('href').split('?')[0],
                      title: img ? img.alt.replace(/のサムネイル$/, '') : '',
                      price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null };
         });
@@ -577,7 +596,7 @@ def discover():
                 continue
             for it in items:
                 u = it["url"]
-                if u in known or u in seen or not it["price"]:
+                if u in known or u in seen or not it["price"] or it.get("auction"):
                     continue
                 seen.add(u)
                 if any(w in it["title"] for w in exclude):
@@ -587,7 +606,7 @@ def discover():
                     continue
                 checked += 1
                 sale, n = ebay_market_usd(q)
-                if not sale or n < 3:          # 比較できる出品が少ないものは信用しない
+                if not sale or n < MIN_COUNT:  # 相場の件数が少ない機種は入れない
                     continue
                 p, rate = profit(it["price"], sale, settings)
                 if rate >= min_margin and p >= min_profit:
