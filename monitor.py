@@ -351,7 +351,8 @@ def main():
             counts[status] = counts.get(status, 0) + 1
             upd = {"row": r["row"], "last_checked": now(), "result": LABEL[status]}
 
-            acc = is_accessory(r.get("title") or "") or is_accessory((info or {}).get("title") or "")
+            title_now = (info or {}).get("title") or r.get("title") or ""
+            acc = is_accessory(title_now, (info or {}).get("price"), r.get("ebay_usd"), settings)
             if r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
                 if acc:
@@ -765,12 +766,20 @@ ACCESSORY_WORDS = ["説明書", "取説", "取扱", "充電器", "充電台", "�
 BODY_WORDS = ["本体", "付き", "付属", "同梱", "セット内容", "揃い", "完品", "一式", "なし", "無し"]
 
 
-def is_accessory(title):
-    """携帯電話本体カテゴリに出ている「説明書だけ」「充電器だけ」などを見分ける"""
+ACCESSORY_PRICE_RATIO = 0.2   # eBay相場のこの割合以下の値段なら「本体にしては安すぎる」
+
+
+def is_accessory(title, price_jpy, sale_usd, settings):
+    """携帯電話本体カテゴリに出ている「説明書だけ」「充電器だけ」などを見分ける。
+    付属品っぽい単語がある「かつ」本体にしては安すぎる、の両方のときだけ付属品とみなす（本体を弾かないため）"""
     t = unicodedata.normalize("NFKC", title or "")
-    if not any(w in t for w in ACCESSORY_WORDS):
+    if not any(w in t for w in ACCESSORY_WORDS) or any(w in t for w in BODY_WORDS):
         return False
-    return not any(w in t for w in BODY_WORDS)   # 「充電器付き」「本体＋説明書」は本体なので残す
+    try:
+        market_jpy = float(sale_usd) * usd_jpy(settings)
+        return float(price_jpy) <= market_jpy * ACCESSORY_PRICE_RATIO
+    except (TypeError, ValueError):
+        return False   # 値段か相場が分からないときは外さない
 
 
 def discover():
@@ -804,7 +813,7 @@ def discover():
                 if u in known or u in seen or not it["price"] or it.get("auction"):
                     continue
                 seen.add(u)
-                if any(w in it["title"] for w in exclude) or is_accessory(it["title"]):
+                if any(w in it["title"] for w in exclude):
                     continue
                 q = guess_query(it["title"])
                 if not q:
@@ -812,6 +821,8 @@ def discover():
                 checked += 1
                 sale, n = ebay_market_usd(q)
                 if not sale or n < MIN_COUNT:  # 相場の件数が少ない機種は入れない
+                    continue
+                if is_accessory(it["title"], it["price"], sale, settings):   # 説明書・充電器だけの出品
                     continue
                 p, rate = profit(it["price"], sale, settings)
                 if rate >= min_margin and p >= min_profit:
@@ -829,7 +840,7 @@ def discover():
                 if u in known or u in seen or not it["price"]:
                     continue
                 seen.add(u)
-                if any(w in it["title"] for w in exclude) or is_accessory(it["title"]):
+                if any(w in it["title"] for w in exclude):
                     continue
                 q = guess_query(it["title"])
                 if not q:
@@ -837,6 +848,8 @@ def discover():
                 checked += 1
                 sale, n = ebay_market_usd(q)
                 if not sale or n < MIN_COUNT:
+                    continue
+                if is_accessory(it["title"], it["price"], sale, settings):
                     continue
                 p, rate = profit(it["price"], sale, settings)
                 if rate >= min_margin and p >= min_profit:
