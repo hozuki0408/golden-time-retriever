@@ -351,9 +351,17 @@ def main():
             counts[status] = counts.get(status, 0) + 1
             upd = {"row": r["row"], "last_checked": now(), "result": LABEL[status]}
 
+            acc = is_accessory(r.get("title") or "") or is_accessory((info or {}).get("title") or "")
             if r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
-                if status in ("sold", "deleted"):
+                if acc:
+                    token = token or get_access_token()
+                    ok, msg = stop_on_ebay(r["ebay_item_id"], token)
+                    upd["result"] = f"説明書・充電器などの単体のため出品を止めました → {msg}"
+                    if ok:
+                        upd["status"] = "stopped"
+                        stopped += 1
+                elif status in ("sold", "deleted"):
                     ok, msg = stop_on_ebay(r["ebay_item_id"], token)
                     upd["result"] = f"{LABEL[status]} → {msg}"
                     if ok:
@@ -388,7 +396,11 @@ def main():
                         pass
             else:
                 # ---- 仕入れ候補：商品名・価格・相場・利益を埋める ----
-                if status in ("sold", "deleted", "auction"):
+                if acc:
+                    upd["result"] = "説明書・充電器などの単体のため候補から外しました"
+                    upd["status"] = "stopped"
+                    upd["list"] = False
+                elif status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
                 elif status == "on_sale" and info and r.get("list"):
@@ -748,6 +760,19 @@ def yahoo_search(keyword):
     return out
 
 
+ACCESSORY_WORDS = ["説明書", "取説", "取扱", "充電器", "充電台", "卓上ホルダ", "卓上ホルダー", "アダプタ", "ACアダプ",
+                   "ケーブル", "電池パック", "外箱", "空箱", "元箱のみ", "付属品のみ", "パーツ", "部品"]
+BODY_WORDS = ["本体", "付き", "付属", "同梱", "セット内容", "揃い", "完品", "一式", "なし", "無し"]
+
+
+def is_accessory(title):
+    """携帯電話本体カテゴリに出ている「説明書だけ」「充電器だけ」などを見分ける"""
+    t = unicodedata.normalize("NFKC", title or "")
+    if not any(w in t for w in ACCESSORY_WORDS):
+        return False
+    return not any(w in t for w in BODY_WORDS)   # 「充電器付き」「本体＋説明書」は本体なので残す
+
+
 def discover():
     data = sheet("list")
     settings = data.get("settings", {})
@@ -779,7 +804,7 @@ def discover():
                 if u in known or u in seen or not it["price"] or it.get("auction"):
                     continue
                 seen.add(u)
-                if any(w in it["title"] for w in exclude):
+                if any(w in it["title"] for w in exclude) or is_accessory(it["title"]):
                     continue
                 q = guess_query(it["title"])
                 if not q:
@@ -804,7 +829,7 @@ def discover():
                 if u in known or u in seen or not it["price"]:
                     continue
                 seen.add(u)
-                if any(w in it["title"] for w in exclude):
+                if any(w in it["title"] for w in exclude) or is_accessory(it["title"]):
                     continue
                 q = guess_query(it["title"])
                 if not q:
