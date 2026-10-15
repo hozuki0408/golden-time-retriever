@@ -56,16 +56,27 @@ def notify(msg):
 
 # ---------- スプレッドシート ----------
 def sheet(action, **payload):
-    r = requests.post(
-        SHEET_API_URL,
-        data=json.dumps({"key": SHEET_API_KEY, "action": action, **payload}),
-        headers={"Content-Type": "text/plain"},
-        timeout=60,
-    )
-    try:
-        data = r.json()
-    except ValueError:
-        raise RuntimeError(f"スプレッドシートの応答が読めません ({r.status_code}): {r.text[:200]}")
+    # Googleの応答がたまに壊れる（書き込み自体は成功していることが多い）ので、数回やり直す
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                SHEET_API_URL,
+                data=json.dumps({"key": SHEET_API_KEY, "action": action, **payload}),
+                headers={"Content-Type": "text/plain"},
+                timeout=60,
+            )
+            data = r.json()
+            break
+        except (ValueError, requests.RequestException):
+            if action == "append":      # 追加は二重にならないよう、やり直さない
+                print("スプレッドシートの応答が読めませんでした（追加）")
+                return {}
+            time.sleep(5 * (attempt + 1))
+    else:
+        if action in ("update", "log", "cleanup"):
+            print(f"スプレッドシートの応答が読めませんでした（{action}）。続行します")
+            return {}
+        raise RuntimeError("スプレッドシートの応答が読めません（3回やり直しても失敗）")
     if data.get("error"):
         raise RuntimeError(f"スプレッドシートのエラー: {data['error']}")
     return data
