@@ -228,6 +228,9 @@ def ebay_market_usd(query):
     return _market_cache[query]
 
 
+MY_SELLER = "golden_time_retriever"
+
+
 def _ebay_market_usd(query):
     r = requests.get(
         "https://api.ebay.com/buy/browse/v1/item_summary/search",
@@ -239,6 +242,8 @@ def _ebay_market_usd(query):
     r.raise_for_status()
     prices = []
     for it in r.json().get("itemSummaries", []):
+        if (it.get("seller", {}).get("username") or "").lower() == MY_SELLER:
+            continue   # 自分の出品は相場に入れない
         try:
             p = float(it["price"]["value"])
             ship = it.get("shippingOptions", [{}])[0].get("shippingCost", {}).get("value")
@@ -323,6 +328,22 @@ def main():
                         notify(f"【停止】{r.get('memo','')} メルカリ{LABEL[status]} → {msg}（eBay {r['ebay_item_id']}）")
                     else:
                         notify(f"【要対応】{r.get('memo','')} メルカリ{LABEL[status]}ですが{msg}（eBay {r['ebay_item_id']}）")
+                elif status == "on_sale" and info.get("price"):
+                    # 出品中の値段を相場に合わせる（ただし利益が最低額を割らない値段まで）
+                    try:
+                        target, floor = market_price_usd(info["price"], (r.get("query") or "").strip(), settings)
+                        if target is not None:
+                            new_price = max(target, floor)
+                            if f"${new_price:.2f}" in (r.get("result") or ""):   # 値段が同じなら何もしない
+                                upd["result"] = r["result"]
+                            else:
+                                ack, errs = trading_call("ReviseInventoryStatus",
+                                    f"<InventoryStatus><ItemID>{r['ebay_item_id']}</ItemID>"
+                                    f"<StartPrice>{new_price:.2f}</StartPrice></InventoryStatus>", token)
+                                if ack in ("Success", "Warning"):
+                                    upd["result"] = f"販売中（eBay ${new_price:.2f}）"
+                    except Exception:
+                        pass
             else:
                 # ---- 仕入れ候補：商品名・価格・相場・利益を埋める ----
                 if status in ("sold", "deleted", "auction"):
@@ -342,6 +363,9 @@ def main():
                         upd["result"] = f"eBayに出品しました（${res['price']:.2f}）→ 売り切れ監視を開始"
                         listed += 1
                         notify(f"【出品】{res['title_en']} ${res['price']:.2f}（eBay {res['ebay_item_id']}）")
+                    elif err and err.startswith("SKIP:"):
+                        upd["result"] = err[5:]
+                        upd["status"] = "stopped"   # 相場では利益が出ない → 候補から外す（自動で行を削除）
                     else:
                         # 失敗理由が次の確認で上書きされないよう「paused」にして残す
                         upd["result"] = f"【出品できず】{err}"
@@ -488,6 +512,20 @@ def build_title(model, title, carrier, unlocked, color):
     return t[:80]
 
 
+def market_price_usd(cost, query, settings):
+    """売れている相場に合わせた値段。利益が最低額（設定の最低利益）を下回るなら None"""
+    sale, n = ebay_market_usd(query) if query else (None, 0)
+    if not sale:
+        return None, None
+    fx = usd_jpy(settings)
+    fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+    ship = float(settings.get("ship_jpy") or 3000)
+    min_profit = float(settings.get("min_profit") or 2000)
+    floor = math.ceil((cost + ship + min_profit) / max(0.05, 1 - fee) / fx) - 0.01   # 利益2,000円が残る最低価格
+    target = math.floor(adj(sale, settings)) + 0.99                                  # 実際に売れている値段の目安
+    return target, floor
+
+
 def list_price_usd(cost, settings):
     fx = usd_jpy(settings)
     fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
@@ -540,7 +578,12 @@ def create_listing(r, info, detail, settings, token):
 
     tr = sheet("translate", texts=[detail.get("condition", ""), detail.get("description", "")[:3000]])["texts"]
     cond_en, desc_en = tr[0], tr[1]
-    price = list_price_usd(cost, settings)
+    target, floor = market_price_usd(cost, model, settings)
+    if target is None:
+        return None, "SKIP:eBayの相場が取れないため出品しません"
+    if target < floor:
+        return None, f"SKIP:相場(${target:.2f})では利益{int(float(settings.get('min_profit') or 2000)):,}円が残らないため出品しません"
+    price = target
     pics = upload_pictures(detail.get("images", []), token)
     if not pics:
         return None, "写真をeBayに取り込めなかったため出品を中止しました（もう一度チェックすると再挑戦します）"
