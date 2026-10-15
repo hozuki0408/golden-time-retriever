@@ -404,8 +404,8 @@ def main():
                 elif status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
-                elif status == "on_sale" and info and r.get("list"):
-                    # ---- 「出品する」にチェック：eBayに出品 ----
+                elif status == "on_sale" and info:
+                    # ---- 販売中の候補はすべてeBayに出品（「出品する」のチェックは不要） ----
                     try:
                         token = token or get_access_token()
                         detail = ydetail if yahoo else page.evaluate(DETAIL_JS)
