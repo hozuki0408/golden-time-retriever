@@ -343,7 +343,9 @@ def main():
                         listed += 1
                         notify(f"【出品】{res['title_en']} ${res['price']:.2f}（eBay {res['ebay_item_id']}）")
                     else:
-                        upd["result"] = err
+                        # 失敗理由が次の確認で上書きされないよう「paused」にして残す
+                        upd["result"] = f"【出品できず】{err}"
+                        upd["status"] = "paused"
                         notify(f"【出品できず】{info.get('title','')[:30]}：{err}")
                 elif status == "on_sale" and info:
                     try:
@@ -443,14 +445,31 @@ def carrier_of(model, text):
     return ""
 
 
+# 型番ごとの正式なシリーズ名（英語タイトルを統一するため）
+SERIES = {
+    "902KC": "Kyocera DIGNO Keitai 3", "701KC": "Kyocera DIGNO Keitai 2", "A202KC": "Kyocera DIGNO Keitai 4",
+    "KY-42C": "Kyocera DIGNO Keitai", "KYF31": "Kyocera GRATINA 4G", "KYF37": "Kyocera GRATINA 4G",
+    "KYF39": "Kyocera GRATINA", "KYF42": "Kyocera GRATINA", "KYF38": "Kyocera TORQUE X01",
+    "601SH": "Sharp AQUOS Keitai 2", "805SH": "Sharp AQUOS Keitai 3", "A205SH": "Sharp AQUOS Keitai 4",
+    "A206SH": "Sharp AQUOS Keitai 4", "SH-01J": "Sharp AQUOS Keitai", "SH-02L": "Sharp AQUOS Keitai",
+    "SH-02K": "Sharp AQUOS Keitai", "F-01G": "Fujitsu Raku-Raku Phone", "F-03L": "Fujitsu Raku-Raku Phone",
+    "P-01G": "Panasonic", "P-01H": "Panasonic", "P-01J": "Panasonic",
+}
+
+
 def build_title(model, title, carrier, unlocked, color):
-    words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", unicodedata.normalize("NFKC", title))
-             if w.upper() not in (model.upper().replace("-", ""), "SIM", "AU", "DOCOMO", "SOFTBANK", "USB", "TYPE")
-             and w.upper() != model.upper()][:3]
-    parts = [brand_of(model, title), *words, model, "Flip Phone", carrier,
-             "Unlocked" if unlocked else "", color, "Keitai Japan"]
+    """どの商品も同じ形：<メーカー シリーズ> <型番> 4G Flip Phone <SIMフリー/キャリア> <色> Japan"""
+    m = model.upper()
+    series = SERIES.get(m) or brand_of(model, title)
+    net = "SIM Unlocked" if unlocked else (carrier or "")
+    gen = "4G " if re.match(r"^(\d{3}|A\d{3})(KC|SH)$|^KY-42C$|^KYF(3[1-9]|4\d)$|^SH-0[12][JKL]$", m) and "4G" not in series else ""
+    parts = [series, model, f"{gen}Flip Phone", net, color, "Japan"]
     t = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip()
-    return t[:80].rsplit(" ", 1)[0] if len(t) > 80 else t
+    if len(t) > 80:   # 長すぎたら色→Japanの順に削る
+        for drop in (color, "Japan"):
+            if drop and len(t) > 80:
+                t = re.sub(r"\s+", " ", t.replace(f" {drop}", "", 1)).strip()
+    return t[:80]
 
 
 def list_price_usd(cost, settings):
@@ -508,8 +527,6 @@ def create_listing(r, info, detail, settings, token):
     pics = upload_pictures(detail.get("images", []), token)
     if not pics:
         return None, "写真をeBayに取り込めなかったため出品を中止しました（もう一度チェックすると再挑戦します）"
-    if not pics:
-        return None, "画像をeBayにアップロードできませんでした"
 
     cond_id = 1000 if "新品" in detail.get("condition", "") else 3000
     specifics = [("Brand", brand_of(model, title_jp)), ("Model", model or "Not Specified"),
