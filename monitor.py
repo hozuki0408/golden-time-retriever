@@ -611,7 +611,17 @@ def main():
 
     sheet("update", updates=updates)
     try:
-        sheet("cleanup")   # 外した候補（eBay未出品）の行を削除
+        # eBayの出品を終了した行は二度と再開しないので、出品番号を消して削除の対象にする
+        rows2 = sheet("list").get("rows", [])
+        clear = [{"row": x["row"], "ebay_item_id": ""} for x in rows2
+                 if x.get("status") == "stopped" and x.get("ebay_item_id")
+                 and re.search(r"出品を終了しました|すでに終了しています", x.get("result") or "")]
+        if clear:
+            sheet("update", updates=clear)
+    except Exception as e:
+        print("終了済みの行の整理に失敗:", str(e)[:100])
+    try:
+        sheet("cleanup")   # 止めた行（売り切れ・候補から外したもの・eBay終了済み）を削除
     except Exception:
         pass
     if blocked:
