@@ -323,6 +323,36 @@ def match_game(title, key):
     if not gi or not gi.get("alias"):
         return False
     return bool(re.search(gi["alias"], t)) and not re.search(gi.get("neg", r"$^"), t)
+
+
+# ゲーム機は「本体カテゴリ」に部品・箱・ソフト・チラシなどが混ざるので、商品名を厳しく確認する
+GAME_HARD_WORDS = re.compile(
+    r"フェイスプレート|プレートのみ|チラシ|広告|ポスター|カタログ|攻略本|非売品|販促|ステッカー|シール|スキン|"
+    r"交換用|修理用|部品取り|パーツ|ドライバー|互換|外箱|内箱|空箱|箱のみ|シェル|外装|ハウジング|"
+    r"ソフト|カセット|UMD|説明書|取説|充電器|ACアダプタ|ケーブル|ポーチ|ケース|カバー|フィルム|"
+    r"動作未確認|未確認|ジャンク|故障|不動|訳あり|難あり|画面割れ|液晶割れ")
+GAME_MIN_PRICE_RATIO = 0.12   # 相場のこれ未満の値段は部品・ジャンクの可能性が高い
+
+
+def game_reject_reason(title, model, price_jpy=None, sale_usd=None, settings=None):
+    """ゲーム機として出品してはいけない理由（なければ空文字）"""
+    t = unicodedata.normalize("NFKC", title or "")
+    if not match_game(t, model):
+        return "商品名に機種名がありません"
+    words = [w for w in GAME_HARD_WORDS.findall(t)
+             if not (w in ("ソフト", "カセット", "UMD", "説明書", "取説", "充電器", "ACアダプタ", "ケーブル",
+                           "ポーチ", "ケース", "カバー", "フィルム", "外箱", "内箱")
+                     and "本体" in t and "のみ" not in t)]   # 「本体＋ソフト付き」「本体 箱付き」は本体
+    if words:
+        return f"本体ではない可能性（{words[0]}）"
+    if re.search(r"(?<!本体)のみ", t):
+        return "本体以外の単品の可能性（〜のみ）"
+    try:
+        if price_jpy and sale_usd and float(price_jpy) < float(sale_usd) * usd_jpy(settings or {}) * GAME_MIN_PRICE_RATIO:
+            return "相場に比べて安すぎる（部品・ジャンクの可能性）"
+    except (TypeError, ValueError):
+        pass
+    return ""
 GAME_EBAY_CATEGORY = "139971"
 MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
 PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
@@ -444,6 +474,9 @@ def main():
 
             title_now = (info or {}).get("title") or r.get("title") or ""
             acc = is_accessory(title_now, (info or {}).get("price"), r.get("ebay_usd"), settings)
+            if not acc and game_info(r.get("query") or ""):
+                acc = bool(game_reject_reason(title_now, (r.get("query") or "").strip(),
+                                              (info or {}).get("price"), r.get("ebay_usd"), settings))
             if r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
                 if acc:
@@ -802,6 +835,8 @@ def create_listing(r, info, detail, settings, token):
     if float(cost) > max_cost(settings):
         return None, f"SKIP:仕入れ値{int(cost):,}円が上限{int(max_cost(settings)):,}円を超えるため出品しません"
     bad = not_a_phone(r, title_jp, detail)
+    if not bad and game_info((r.get("query") or "").strip()):
+        bad = game_reject_reason(title_jp, (r.get("query") or "").strip(), cost, r.get("ebay_usd"), settings)
     if bad:
         return None, f"SKIP:{bad}のため出品しません"
     t = prepare_text(r, info, detail)
@@ -1005,6 +1040,8 @@ def discover():
                     continue
                 if is_accessory(it["title"], it["price"], sale, settings):   # 説明書・充電器だけの出品
                     continue
+                if game_info(q) and game_reject_reason(it["title"], q, it["price"], sale, settings):
+                    continue   # ゲーム機は商品名で本体かどうかを厳しく確認
                 p, rate = profit(it["price"], sale, settings)
                 if rate >= min_margin and p >= min_profit:
                     found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
@@ -1034,6 +1071,8 @@ def discover():
                 if not sale or n < MIN_COUNT:
                     continue
                 if is_accessory(it["title"], it["price"], sale, settings):
+                    continue
+                if game_info(q) and game_reject_reason(it["title"], q, it["price"], sale, settings):
                     continue
                 p, rate = profit(it["price"], sale, settings)
                 if rate >= min_margin and p >= min_profit:
