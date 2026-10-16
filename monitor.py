@@ -120,20 +120,23 @@ def trading_call(call_name, body_xml, token):
 
 
 def stop_on_ebay(item_id, token):
+    """在庫がなくなったらeBayの出品を終了する（終了できないときだけ在庫0にする）"""
     ack, errors = trading_call(
-        "ReviseInventoryStatus",
-        f"<InventoryStatus><ItemID>{item_id}</ItemID><Quantity>0</Quantity></InventoryStatus>",
-        token,
-    )
-    if ack in ("Success", "Warning"):
-        return True, "eBay在庫を0にしました"
-    ack2, errors2 = trading_call(
         "EndFixedPriceItem",
         f"<ItemID>{item_id}</ItemID><EndingReason>NotAvailable</EndingReason>",
         token,
     )
+    if ack in ("Success", "Warning"):
+        return True, "eBayの出品を終了しました"
+    if any(re.search(r"already (been )?(ended|closed)|has ended|終了", e, re.I) for e in errors):
+        return True, "eBayの出品はすでに終了しています"
+    ack2, errors2 = trading_call(
+        "ReviseInventoryStatus",
+        f"<InventoryStatus><ItemID>{item_id}</ItemID><Quantity>0</Quantity></InventoryStatus>",
+        token,
+    )
     if ack2 in ("Success", "Warning"):
-        return True, "在庫0にできず、eBay出品を終了しました"
+        return True, "出品を終了できず、eBay在庫を0にしました"
     return False, f"eBay停止に失敗: {' / '.join(errors + errors2)[:200]}"
 
 
@@ -1016,12 +1019,36 @@ def restore():
     sheet("log", message=msg)
 
 
+def end_stopped():
+    """在庫0で止めたままの出品（売り切れ・本体でない商品など）をeBayで終了する（1回だけ実行）"""
+    data = sheet("list")
+    token = get_access_token()
+    rows = [r for r in data["rows"] if r["ebay_item_id"] and r["status"] == "stopped"
+            and "出品を終了しました" not in (r.get("result") or "")]
+    updates, ok_n, fail_n = [], 0, 0
+    for r in rows:
+        ok, msg = stop_on_ebay(r["ebay_item_id"], token)
+        if ok:
+            ok_n += 1
+            updates.append({"row": r["row"], "result": f"{(r.get('result') or '')[:80]} → {msg}"})
+        else:
+            fail_n += 1
+            print("終了できず:", r["ebay_item_id"], msg)
+    if updates:
+        sheet("update", updates=updates)
+    msg = f"{now()} 在庫なしの出品の終了：{ok_n}件／失敗 {fail_n}件"
+    print(msg)
+    sheet("log", message=msg)
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "discover":
             discover()
         elif len(sys.argv) > 1 and sys.argv[1] == "fixdesc":
             fixdesc()
+        elif len(sys.argv) > 1 and sys.argv[1] == "endstopped":
+            end_stopped()
         elif len(sys.argv) > 1 and sys.argv[1] == "restore":
             restore()
             fixdesc()
