@@ -1,4 +1,4 @@
-name: 1回だけの作業（在庫なしの出品を終了）
+name: 1回だけの作業（誤って止めた出品の復元）
 
 on:
   workflow_dispatch:          # 手動実行のみ
@@ -32,8 +32,8 @@ jobs:
 
       - run: python -m playwright install --with-deps chromium
 
-      - name: 在庫なしの出品をeBayで終了
-        run: python monitor.py endstopped
+      - name: 誤って止めた出品を元に戻す
+        run: python monitor.py restore
         env:
           EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
