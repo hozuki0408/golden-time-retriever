@@ -277,7 +277,52 @@ GAMES = {
     "PSP-3000": {"brand": "Sony", "platform": "Sony PSP", "series": "Sony PSP-3000", "mercari": "7076"},
     "PCH-1000": {"brand": "Sony", "platform": "Sony PlayStation Vita", "series": "Sony PS Vita PCH-1000", "mercari": "7058"},
     "PCH-2000": {"brand": "Sony", "platform": "Sony PlayStation Vita", "series": "Sony PS Vita PCH-2000", "mercari": "7058"},
+    # 任天堂の携帯機：メルカリは機種ごとの本体カテゴリ（exact）、Yahoo!フリマは呼び名（alias）で見分ける
+    "DMG-01": {"brand": "Nintendo", "platform": "Nintendo Game Boy", "series": "Nintendo Game Boy DMG-01",
+               "mercari": "7181", "exact": True, "yahoo_q": "ゲームボーイ 本体", "ebay_q": "Game Boy DMG-01",
+               "alias": r"ゲームボーイ|GAME ?BOY|DMG", "neg": r"ポケット|カラー|アドバンス|ミクロ|ライト|POCKET|COLOR|ADVANCE|MICRO|GBA|GBC|SP"},
+    "MGB-001": {"brand": "Nintendo", "platform": "Nintendo Game Boy Pocket", "series": "Nintendo Game Boy Pocket MGB-001",
+                "mercari": "8907", "exact": True, "yahoo_q": "ゲームボーイポケット", "ebay_q": "Game Boy Pocket",
+                "alias": r"ゲームボーイ\s*ポケット|GAME ?BOY ?POCKET|MGB", "neg": r"ライト|カラー|LIGHT|COLOR"},
+    "CGB-001": {"brand": "Nintendo", "platform": "Nintendo Game Boy Color", "series": "Nintendo Game Boy Color CGB-001",
+                "mercari": "8908", "exact": True, "yahoo_q": "ゲームボーイカラー", "ebay_q": "Game Boy Color CGB-001",
+                "alias": r"ゲームボーイ\s*カラー|GAME ?BOY ?COLOU?R|GBC|CGB", "neg": r"アドバンス|ADVANCE"},
+    "AGB-001": {"brand": "Nintendo", "platform": "Nintendo Game Boy Advance", "series": "Nintendo Game Boy Advance AGB-001",
+                "mercari": "7174", "exact": True, "yahoo_q": "ゲームボーイアドバンス", "ebay_q": "Game Boy Advance AGB-001",
+                "alias": r"アドバンス|ADVANCE|GBA|AGB", "neg": r"SP|ミクロ|MICRO|AGS|OXY"},
+    "AGS-001": {"brand": "Nintendo", "platform": "Nintendo Game Boy Advance SP", "series": "Nintendo Game Boy Advance SP AGS-001",
+                "mercari": "8904", "exact": True, "yahoo_q": "ゲームボーイアドバンスSP", "ebay_q": "Game Boy Advance SP",
+                "alias": r"アドバンス\s*SP|ADVANCE ?SP|GBA ?SP|AGS", "neg": r"$^"},
+    "OXY-001": {"brand": "Nintendo", "platform": "Nintendo Game Boy Micro", "series": "Nintendo Game Boy Micro OXY-001",
+                "mercari": "7178", "exact": True, "yahoo_q": "ゲームボーイミクロ", "ebay_q": "Game Boy Micro",
+                "alias": r"ミクロ|MICRO|OXY", "neg": r"$^"},
+    "USG-001": {"brand": "Nintendo", "platform": "Nintendo DS Lite", "series": "Nintendo DS Lite USG-001",
+                "mercari": "8899", "exact": True, "yahoo_q": "DS Lite", "ebay_q": "Nintendo DS Lite",
+                "alias": r"DS\s*(LITE|ライト)|DSL|USG", "neg": r"3DS|DSI"},
+    "TWL-001": {"brand": "Nintendo", "platform": "Nintendo DSi", "series": "Nintendo DSi TWL-001",
+                "mercari": "8898", "exact": True, "yahoo_q": "DSi", "ebay_q": "Nintendo DSi TWL-001",
+                "alias": r"DSI|TWL", "neg": r"3DS|LL|XL"},
+    "CTR-001": {"brand": "Nintendo", "platform": "Nintendo 3DS", "series": "Nintendo 3DS CTR-001",
+                "mercari": "7022", "exact": True, "yahoo_q": "3DS", "ebay_q": "Nintendo 3DS CTR-001", "region_lock": True,
+                "alias": r"3DS|CTR", "neg": r"NEW|ニュー|LL|XL|2DS"},
+    "SPR-001": {"brand": "Nintendo", "platform": "Nintendo 3DS LL", "series": "Nintendo 3DS LL SPR-001",
+                "mercari": "7038", "exact": True, "yahoo_q": "3DS LL", "ebay_q": "Nintendo 3DS LL SPR-001", "region_lock": True,
+                "alias": r"3DS\s*(LL|XL)|SPR", "neg": r"NEW|ニュー|2DS"},
+    "RED-001": {"brand": "Nintendo", "platform": "New Nintendo 3DS LL", "series": "New Nintendo 3DS LL RED-001",
+                "mercari": "8882", "exact": True, "yahoo_q": "New 3DS LL", "ebay_q": "New Nintendo 3DS LL", "region_lock": True,
+                "alias": r"(NEW|ニュー)\s*(ニンテンドー)?\s*3DS\s*(LL|XL)|RED-001", "neg": r"2DS"},
 }
+
+
+def match_game(title, key):
+    """商品名がその機種か（型番が書いてあるか、呼び名が合っていて別機種の名前がない）"""
+    gi = GAMES.get(key)
+    t = unicodedata.normalize("NFKC", title or "").upper()
+    if has_model(t, key):
+        return True
+    if not gi or not gi.get("alias"):
+        return False
+    return bool(re.search(gi["alias"], t)) and not re.search(gi.get("neg", r"$^"), t)
 GAME_EBAY_CATEGORY = "139971"
 MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
 PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
@@ -305,7 +350,8 @@ def min_profit_for(cost, settings):
 def _ebay_market_usd(query):
     r = requests.get(
         "https://api.ebay.com/buy/browse/v1/item_summary/search",
-        params={"q": query, "category_ids": GAME_EBAY_CATEGORY if game_info(query) else "9355",
+        params={"q": (game_info(query) or {}).get("ebay_q", query),
+                "category_ids": GAME_EBAY_CATEGORY if game_info(query) else "9355",
                 "filter": "buyingOptions:{FIXED_PRICE},conditions:{USED}", "limit": 50},
         headers={"Authorization": f"Bearer {app_token()}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
         timeout=30,
@@ -686,7 +732,7 @@ def clean_desc(text):
     return "\n".join(lines)[:1500]
 
 
-PHONE_CATEGORY = re.compile(r"携帯電話本体|スマートフォン本体|PHS本体|本体[(（]PSP|ヴィータ[)）]\s*>\s*本体|(PSP|ポータブル)[)）]\s*>\s*本体")
+PHONE_CATEGORY = re.compile(r"携帯電話本体|スマートフォン本体|PHS本体|本体[(（]|テレビゲーム.*>\s*本体")
 
 
 def not_a_phone(r, title_jp, detail):
@@ -727,6 +773,10 @@ def prepare_text(r, info, detail):
             "(charger, memory card, games and accessories are included only if pictured).</p>"
             + (f"<h3>Notes from the original Japanese description (machine translated)</h3><p>{escape(desc_en).replace(chr(10), '<br>')}</p>" if desc_en else "")
             + "<p>Ships from Japan. Thank you for looking!</p>")
+        if gi.get("region_lock"):
+            desc_html = desc_html.replace(
+                "<p>Ships from Japan.",
+                "<p><b>Region:</b> This is a Japanese 3DS system. It plays Japanese region games only.</p><p>Ships from Japan.")
         return {"title_jp": title_jp, "model": model, "unlocked": unlocked, "carrier": carrier, "color": color,
                 "title_en": title_en, "cond_en": cond_en, "desc_html": desc_html}
     desc_html = (
@@ -831,7 +881,7 @@ YAHOO_HEADERS = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
                  "Accept": "application/json", "Referer": "https://paypayfleamarket.yahoo.co.jp/"}
 YAHOO_PHONE_CATEGORY = 38419   # 携帯電話本体
-YAHOO_OK_CATEGORIES = {38419, 37849, 37661}   # 携帯電話本体・PSP本体・PS Vita本体
+YAHOO_OK_CATEGORIES = {38419, 37849, 37661, 37697, 37799, 37808, 38155}   # 携帯電話・PSP・Vita・DS・GB・GBA・3DS の本体
 
 
 def is_yahoo(url):
@@ -931,7 +981,8 @@ def discover():
         for kw in keywords:
             gi = game_info(kw)
             url = ("https://jp.mercari.com/search?status=on_sale&sort=created_time&order=desc"
-                   f"&category_id={gi['mercari'] if gi else '860'}&keyword=" + requests.utils.quote(kw))   # 本体カテゴリ
+                   f"&category_id={gi['mercari'] if gi else '860'}&keyword="
+                   + ("" if gi and gi.get("exact") else requests.utils.quote(kw)))   # 本体カテゴリ（機種別カテゴリなら検索語なし）
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_selector('a[href*="/item/m"], a[href*="/shops/product/"]', timeout=25000)
@@ -945,7 +996,7 @@ def discover():
                 seen.add(u)
                 if any(w in it["title"] for w in exclude):
                     continue
-                q = guess_query(it["title"])
+                q = kw if gi and gi.get("exact") else guess_query(it["title"])   # 機種別カテゴリならその機種
                 if not q:
                     continue
                 checked += 1
@@ -962,7 +1013,7 @@ def discover():
                                   "result": f"自動発見 {now()}"})
             # Yahoo!フリマも同じキーワードで探す
             try:
-                yitems = yahoo_search(kw)
+                yitems = yahoo_search(gi.get("yahoo_q", kw) if gi else kw)
             except Exception:
                 yitems = []
             for it in yitems:
@@ -972,7 +1023,10 @@ def discover():
                 seen.add(u)
                 if any(w in it["title"] for w in exclude):
                     continue
-                q = guess_query(it["title"])
+                if gi and gi.get("alias"):
+                    q = kw if match_game(it["title"], kw) else ""   # 呼び名で機種を見分ける
+                else:
+                    q = guess_query(it["title"])
                 if not q:
                     continue
                 checked += 1
