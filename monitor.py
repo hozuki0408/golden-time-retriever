@@ -384,6 +384,14 @@ SOLD90 = {"902KC": 41, "KY-42C": 23, "601SH": 20, "A202KC": 18, "P-01G": 18, "90
 
 def model_key(q):
     return re.sub(r"[-\s]", "", (q or "").upper())
+
+
+SOLD90_BY_KEY = {model_key(k): v for k, v in SOLD90.items()}
+
+
+def cap_for(q):
+    """機種ごとの出品数の上限：よく売れる機種ほど多く出す（90日の販売台数÷4、最低3件・最大20件）"""
+    return max(MAX_PER_MODEL, min(20, round(SOLD90_BY_KEY.get(model_key(q), 0) / 4)))
 MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
 PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
 
@@ -580,8 +588,8 @@ def main():
                 elif status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
-                elif status == "on_sale" and info and listed_per_model.get(model_key(r.get("query")), 0) >= MAX_PER_MODEL:
-                    upd["result"] = f"同じ機種がすでに{MAX_PER_MODEL}件出品中のため候補から外しました"
+                elif status == "on_sale" and info and listed_per_model.get(model_key(r.get("query")), 0) >= cap_for(r.get("query")):
+                    upd["result"] = f"同じ機種がすでに{cap_for(r.get('query'))}件出品中のため候補から外しました"
                     upd["status"] = "stopped"
                 elif status == "on_sale" and info and quota_hit:
                     upd["result"] = "【待機】eBayの月間出品枠の上限のため、枠が空くまで待ちます"
@@ -1165,7 +1173,7 @@ def discover():
     added = []
     for x in found:
         k = model_key(x["query"])
-        if per_model.get(k, 0) >= MAX_PER_MODEL:
+        if per_model.get(k, 0) >= cap_for(x["query"]):
             continue
         per_model[k] = per_model.get(k, 0) + 1
         added.append(x)
