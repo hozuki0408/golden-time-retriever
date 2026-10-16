@@ -269,11 +269,43 @@ def ebay_market_usd(query):
 
 MY_SELLER = "golden_time_retriever"
 
+# ---------- 携帯ゲーム機（ガラケーと同じ仕組みで扱う） ----------
+# mercari: メルカリの本体カテゴリ、ebay_cat: eBayのカテゴリ（Video Game Consoles）
+GAMES = {
+    "PSP-1000": {"brand": "Sony", "platform": "Sony PSP", "series": "Sony PSP-1000", "mercari": "7076"},
+    "PSP-2000": {"brand": "Sony", "platform": "Sony PSP", "series": "Sony PSP-2000", "mercari": "7076"},
+    "PSP-3000": {"brand": "Sony", "platform": "Sony PSP", "series": "Sony PSP-3000", "mercari": "7076"},
+    "PCH-1000": {"brand": "Sony", "platform": "Sony PlayStation Vita", "series": "Sony PS Vita PCH-1000", "mercari": "7058"},
+    "PCH-2000": {"brand": "Sony", "platform": "Sony PlayStation Vita", "series": "Sony PS Vita PCH-2000", "mercari": "7058"},
+}
+GAME_EBAY_CATEGORY = "139971"
+MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
+PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
+
+
+def game_info(model):
+    key = re.sub(r"[-\s]", "", (model or "").upper())
+    for k, v in GAMES.items():
+        if k.replace("-", "") == key:
+            return v
+    return None
+
+
+def max_cost(settings):
+    try:
+        return float(settings.get("max_cost") or MAX_COST_DEFAULT)
+    except (TypeError, ValueError):
+        return MAX_COST_DEFAULT
+
+
+def min_profit_for(cost, settings):
+    return max(float(settings.get("min_profit") or 2000), float(cost or 0) * PROFIT_RATIO)
+
 
 def _ebay_market_usd(query):
     r = requests.get(
         "https://api.ebay.com/buy/browse/v1/item_summary/search",
-        params={"q": query, "category_ids": "9355",
+        params={"q": query, "category_ids": GAME_EBAY_CATEGORY if game_info(query) else "9355",
                 "filter": "buyingOptions:{FIXED_PRICE},conditions:{USED}", "limit": 50},
         headers={"Authorization": f"Bearer {app_token()}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
         timeout=30,
@@ -592,8 +624,8 @@ def market_price_usd(cost, query, settings):
     fx = usd_jpy(settings)
     fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
     ship = float(settings.get("ship_jpy") or 3000)
-    min_profit = float(settings.get("min_profit") or 2000)
-    floor = math.ceil((cost + ship + min_profit) / max(0.05, 1 - fee) / fx) - 0.01   # 利益2,000円が残る最低価格
+    min_profit = min_profit_for(cost, settings)
+    floor = math.ceil((cost + ship + min_profit) / max(0.05, 1 - fee) / fx) - 0.01   # 最低利益が残る最低価格
     target = math.floor(adj(sale, settings)) + 0.99                                  # 実際に売れている値段の目安
     return target, floor
 
@@ -654,7 +686,7 @@ def clean_desc(text):
     return "\n".join(lines)[:1500]
 
 
-PHONE_CATEGORY = re.compile(r"携帯電話本体|スマートフォン本体|PHS本体")
+PHONE_CATEGORY = re.compile(r"携帯電話本体|スマートフォン本体|PHS本体|本体[(（]PSP|ヴィータ[)）]\s*>\s*本体|(PSP|ポータブル)[)）]\s*>\s*本体")
 
 
 def not_a_phone(r, title_jp, detail):
@@ -679,9 +711,24 @@ def prepare_text(r, info, detail):
     carrier = carrier_of(model, text)
     color = next((en for jp, en in COLORS.items() if jp in title_jp), "") or \
         next((en for jp, en in COLORS.items() if jp in detail.get("description", "")), "")
-    title_en = build_title(model, title_jp, carrier, unlocked, color)
+    gi = game_info(model)
+    if gi:
+        title_en = re.sub(r"\s+", " ", f"{gi['series']} Handheld Console {color} Japan").strip()[:80]
+    else:
+        title_en = build_title(model, title_jp, carrier, unlocked, color)
     tr = sheet("translate", texts=[detail.get("condition", ""), clean_desc(detail.get("description", ""))])["texts"]
     cond_en, desc_en = tr[0], clean_desc(tr[1])
+    if gi:
+        desc_html = (
+            f"<h2>{escape(title_en)}</h2>"
+            f"<p><b>Model:</b> {escape(model)}<br><b>Platform:</b> {escape(gi['platform'])}<br>"
+            f"<b>Version:</b> Japanese model<br><b>Condition:</b> {escape(cond_en)}</p>"
+            "<p>Japanese handheld game console. Only the items shown in the photos are included "
+            "(charger, memory card, games and accessories are included only if pictured).</p>"
+            + (f"<h3>Notes from the original Japanese description (machine translated)</h3><p>{escape(desc_en).replace(chr(10), '<br>')}</p>" if desc_en else "")
+            + "<p>Ships from Japan. Thank you for looking!</p>")
+        return {"title_jp": title_jp, "model": model, "unlocked": unlocked, "carrier": carrier, "color": color,
+                "title_en": title_en, "cond_en": cond_en, "desc_html": desc_html}
     desc_html = (
         f"<h2>{escape(title_en)}</h2>"
         f"<p><b>Model:</b> {escape(model)}<br><b>Carrier:</b> {escape(carrier or 'See description')}<br>"
@@ -702,6 +749,8 @@ def create_listing(r, info, detail, settings, token):
         return None, "価格が読み取れないため出品できません"
     if not settings.get("ship_profile"):
         return None, "「設定」シートに配送ポリシー名が入っていません"
+    if float(cost) > max_cost(settings):
+        return None, f"SKIP:仕入れ値{int(cost):,}円が上限{int(max_cost(settings)):,}円を超えるため出品しません"
     bad = not_a_phone(r, title_jp, detail)
     if bad:
         return None, f"SKIP:{bad}のため出品しません"
@@ -712,26 +761,34 @@ def create_listing(r, info, detail, settings, token):
     if target is None:
         return None, "SKIP:eBayの相場が取れないため出品しません"
     if target < floor:
-        return None, f"SKIP:相場(${target:.2f})では利益{int(float(settings.get('min_profit') or 2000)):,}円が残らないため出品しません"
+        return None, f"SKIP:相場(${target:.2f})では利益{int(min_profit_for(cost, settings)):,}円が残らないため出品しません"
     price = target
     pics = upload_pictures(detail.get("images", []), token)
     if not pics:
         return None, "写真をeBayに取り込めなかったため出品を中止しました（もう一度チェックすると再挑戦します）"
 
     cond_id = 1000 if "新品" in detail.get("condition", "") else 3000
-    specifics = [("Brand", brand_of(model, title_jp)), ("Model", model or "Not Specified"),
-                 ("Network", "Unlocked" if unlocked else (carrier or "Unknown")),
-                 ("Lock Status", "Network Unlocked" if unlocked else "Network Locked" if carrier else "Unknown"),
-                 ("Country of Origin", "Japan")]
-    # eBay必須：Color と Storage Capacity
-    specifics.append(("Color", color or "As Pictured"))
-    specifics.append(("Storage Capacity", storage_of(model)))
+    gi = game_info(model)
+    if gi:
+        category_id = GAME_EBAY_CATEGORY
+        specifics = [("Brand", gi["brand"]), ("Model", model), ("Platform", gi["platform"]),
+                     ("Type", "Handheld System"), ("Region Code", "NTSC-J (Japan)"),
+                     ("Color", color or "As Pictured"), ("Country of Origin", "Japan")]
+    else:
+        category_id = "9355"
+        specifics = [("Brand", brand_of(model, title_jp)), ("Model", model or "Not Specified"),
+                     ("Network", "Unlocked" if unlocked else (carrier or "Unknown")),
+                     ("Lock Status", "Network Unlocked" if unlocked else "Network Locked" if carrier else "Unknown"),
+                     ("Country of Origin", "Japan")]
+        # eBay必須：Color と Storage Capacity
+        specifics.append(("Color", color or "As Pictured"))
+        specifics.append(("Storage Capacity", storage_of(model)))
     nvl = "".join(f"<NameValueList><Name>{escape(n)}</Name><Value>{escape(v)}</Value></NameValueList>" for n, v in specifics)
     sku = re.sub(r"[^A-Za-z0-9]", "", r["mercari_url"].rstrip("/").split("/")[-1])[:50]
     item = (
         f"<Item><Title>{escape(title_en)}</Title>"
         f"<Description><![CDATA[{desc_html}]]></Description>"
-        "<PrimaryCategory><CategoryID>9355</CategoryID></PrimaryCategory>"
+        f"<PrimaryCategory><CategoryID>{category_id}</CategoryID></PrimaryCategory>"
         f'<StartPrice currencyID="USD">{price:.2f}</StartPrice>'
         f"<ConditionID>{cond_id}</ConditionID>"
         + (f"<ConditionDescription>{escape(cond_en[:900])}</ConditionDescription>" if cond_id != 1000 else "") +
@@ -774,6 +831,7 @@ YAHOO_HEADERS = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
                  "Accept": "application/json", "Referer": "https://paypayfleamarket.yahoo.co.jp/"}
 YAHOO_PHONE_CATEGORY = 38419   # 携帯電話本体
+YAHOO_OK_CATEGORIES = {38419, 37849, 37661}   # 携帯電話本体・PSP本体・PS Vita本体
 
 
 def is_yahoo(url):
@@ -816,7 +874,7 @@ def yahoo_search(keyword):
     r.raise_for_status()
     out = []
     for it in r.json().get("items", []):
-        if (it.get("category") or {}).get("id") != YAHOO_PHONE_CATEGORY:
+        if (it.get("category") or {}).get("id") not in YAHOO_OK_CATEGORIES:
             continue          # 携帯電話本体以外（電池・ケースなど）は除く
         if it.get("condition") == "used80":
             continue          # 全体的に状態が悪い
@@ -864,8 +922,9 @@ def discover():
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
         for kw in keywords:
+            gi = game_info(kw)
             url = ("https://jp.mercari.com/search?status=on_sale&sort=created_time&order=desc"
-                   "&category_id=860&keyword=" + requests.utils.quote(kw))   # 携帯電話本体カテゴリ
+                   f"&category_id={gi['mercari'] if gi else '860'}&keyword=" + requests.utils.quote(kw))   # 本体カテゴリ
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_selector('a[href*="/item/m"], a[href*="/shops/product/"]', timeout=25000)
@@ -874,7 +933,7 @@ def discover():
                 continue
             for it in items:
                 u = it["url"]
-                if u in known or u in seen or not it["price"] or it.get("auction"):
+                if u in known or u in seen or not it["price"] or it.get("auction") or it["price"] > max_cost(settings):
                     continue
                 seen.add(u)
                 if any(w in it["title"] for w in exclude):
@@ -901,7 +960,7 @@ def discover():
                 yitems = []
             for it in yitems:
                 u = it["url"]
-                if u in known or u in seen or not it["price"]:
+                if u in known or u in seen or not it["price"] or it["price"] > max_cost(settings):
                     continue
                 seen.add(u)
                 if any(w in it["title"] for w in exclude):
