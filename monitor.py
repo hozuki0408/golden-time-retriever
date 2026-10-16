@@ -369,6 +369,9 @@ def game_reject_reason(title, model, price_jpy=None, sale_usd=None, settings=Non
         pass
     return ""
 GAME_EBAY_CATEGORY = "139971"
+# ゲームボーイ系は古くて仕入れが高く数も少ないので、利益が大きく取れるときだけ扱う
+GAMEBOY_MODELS = {"DMG-01", "MGB-001", "CGB-001", "AGB-001", "AGS-001", "OXY-001"}
+GAMEBOY_MIN_PROFIT = 10000
 MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
 PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
 
@@ -388,8 +391,11 @@ def max_cost(settings):
         return MAX_COST_DEFAULT
 
 
-def min_profit_for(cost, settings):
-    return max(float(settings.get("min_profit") or 2000), float(cost or 0) * PROFIT_RATIO)
+def min_profit_for(cost, settings, model=""):
+    base = max(float(settings.get("min_profit") or 2000), float(cost or 0) * PROFIT_RATIO)
+    if (model or "").strip().upper() in GAMEBOY_MODELS:
+        base = max(base, GAMEBOY_MIN_PROFIT)
+    return base
 
 
 def _ebay_market_usd(query):
@@ -731,7 +737,7 @@ def market_price_usd(cost, query, settings):
     fx = usd_jpy(settings)
     fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
     ship = float(settings.get("ship_jpy") or 3000)
-    min_profit = min_profit_for(cost, settings)
+    min_profit = min_profit_for(cost, settings, query)
     floor = math.ceil((cost + ship + min_profit) / max(0.05, 1 - fee) / fx) - 0.01   # 最低利益が残る最低価格
     target = math.floor(adj(sale, settings)) + 0.99                                  # 実際に売れている値段の目安
     return target, floor
@@ -874,7 +880,7 @@ def create_listing(r, info, detail, settings, token):
     if target is None:
         return None, "SKIP:eBayの相場が取れないため出品しません"
     if target < floor:
-        return None, f"SKIP:相場(${target:.2f})では利益{int(min_profit_for(cost, settings)):,}円が残らないため出品しません"
+        return None, f"SKIP:相場(${target:.2f})では利益{int(min_profit_for(cost, settings, model)):,}円が残らないため出品しません"
     price = target
     pics = upload_pictures(detail.get("images", []), token)
     if not pics:
@@ -1071,7 +1077,7 @@ def discover():
                 if game_info(q) and game_reject_reason(it["title"], q, it["price"], sale, settings):
                     continue   # ゲーム機は商品名で本体かどうかを厳しく確認
                 p, rate = profit(it["price"], sale, settings)
-                if rate >= min_margin and p >= min_profit:
+                if rate >= min_margin and p >= max(min_profit, min_profit_for(0, settings, q)):
                     found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
                                   "ebay_usd": sale, "ebay_count": n, "query": q,
                                   "profit": p, "margin": rate, "memo": "自動発見",
@@ -1103,7 +1109,7 @@ def discover():
                 if game_info(q) and game_reject_reason(it["title"], q, it["price"], sale, settings):
                     continue
                 p, rate = profit(it["price"], sale, settings)
-                if rate >= min_margin and p >= min_profit:
+                if rate >= min_margin and p >= max(min_profit, min_profit_for(0, settings, q)):
                     found.append({"mercari_url": u, "title": it["title"], "cost": it["price"],
                                   "ebay_usd": sale, "ebay_count": n, "query": q,
                                   "profit": p, "margin": rate, "memo": "自動発見（Yahoo!フリマ）",
