@@ -331,6 +331,21 @@ GAME_HARD_WORDS = re.compile(
     r"交換用|修理用|部品取り|パーツ|ドライバー|互換|外箱|内箱|空箱|箱のみ|シェル|外装|ハウジング|"
     r"ソフト|カセット|UMD|説明書|取説|充電器|ACアダプタ|ケーブル|ポーチ|ケース|カバー|フィルム|"
     r"動作未確認|未確認|ジャンク|故障|不動|訳あり|難あり|画面割れ|液晶割れ")
+# 説明文に「本体は付属しません」など、本体が入っていないことが書かれている出品（本体に見せかけた出品を防ぐ）
+NO_BODY_RE = re.compile(
+    r"本体(は|が)?\s*(付属し(ません|ない)|含まれ(ません|ない)|入って(いません|いない|おりません)|ありません|ございません|"
+    r"付きません|つきません|なし|無し|ない|ナシ)|本体\s*(なし|無し|ナシ|別売)|"
+    r"(外箱|空箱|箱|ケース|説明書|付属品|ソフト|カセット|シェル|外装|プレート|パーツ)(だけ|のみ)の(出品|販売)|"
+    r"(外箱|空箱|付属品|説明書|ケース|シェル|外装)のみ(です|となります|の出品|の販売|になります)|"
+    r"(画像|写真)の(外箱|箱)のみ|部品取り|パーツ取り")
+
+
+def no_body_reason(text):
+    t = unicodedata.normalize("NFKC", text or "")
+    m = NO_BODY_RE.search(t)
+    return f"説明に本体が入っていない旨の記載（{m.group(0)[:20]}）" if m else ""
+
+
 GAME_MIN_PRICE_RATIO = 0.12   # 相場のこれ未満の値段は部品・ジャンクの可能性が高い
 
 
@@ -463,6 +478,7 @@ def main():
         # 高速化：画像・動画・フォントは読み込まない（判定に不要。写真のURLはページ内に残る）
         page.route("**/*", lambda route: route.abort()
                    if route.request.resource_type in ("image", "media", "font") else route.continue_())
+        desc_stops = 0   # 説明文の理由で止めるのは1回5件まで（判定の不具合で大量に止めないため）
         for r in targets:
             yahoo = is_yahoo(r["mercari_url"])
             if yahoo:
@@ -477,6 +493,18 @@ def main():
             if not acc and game_info(r.get("query") or ""):
                 acc = bool(game_reject_reason(title_now, (r.get("query") or "").strip(),
                                               (info or {}).get("price"), r.get("ebay_usd"), settings))
+            if not acc and r["ebay_item_id"] and status == "on_sale":
+                # 出品中の商品は説明文も確認（本体なし・箱のみなどの記載があれば止める）
+                try:
+                    desc_now = (ydetail if yahoo else page.evaluate(DETAIL_JS)).get("description", "")
+                except Exception:
+                    desc_now = ""
+                why = no_body_reason(title_now + "\n" + desc_now)
+                if why and desc_stops < 5:
+                    acc = True
+                    desc_stops += 1
+                elif why:
+                    upd["result"] = f"【要確認】{why}（一度に止める件数の上限のため止めていません）"
             if r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
                 if acc:
@@ -834,7 +862,7 @@ def create_listing(r, info, detail, settings, token):
         return None, "「設定」シートに配送ポリシー名が入っていません"
     if float(cost) > max_cost(settings):
         return None, f"SKIP:仕入れ値{int(cost):,}円が上限{int(max_cost(settings)):,}円を超えるため出品しません"
-    bad = not_a_phone(r, title_jp, detail)
+    bad = not_a_phone(r, title_jp, detail) or no_body_reason(title_jp + "\n" + detail.get("description", ""))
     if not bad and game_info((r.get("query") or "").strip()):
         bad = game_reject_reason(title_jp, (r.get("query") or "").strip(), cost, r.get("ebay_usd"), settings)
     if bad:
