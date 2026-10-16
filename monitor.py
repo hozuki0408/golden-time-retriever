@@ -372,6 +372,18 @@ GAME_EBAY_CATEGORY = "139971"
 # ゲームボーイ系は古くて仕入れが高く数も少ないので、利益が大きく取れるときだけ扱う
 GAMEBOY_MODELS = {"DMG-01", "MGB-001", "CGB-001", "AGB-001", "AGS-001", "OXY-001"}
 GAMEBOY_MIN_PROFIT = 10000
+
+# 出品枠（月350件・2万ドル）を有効に使うためのルール
+MAX_PER_MODEL = 3   # 同じ機種の出品は3件まで（仕入れが安い＝利益が大きいものを残す）
+# 過去90日にeBayで売れた台数（多い機種ほど優先して出品枠を使う）
+SOLD90 = {"902KC": 41, "KY-42C": 23, "601SH": 20, "A202KC": 18, "P-01G": 18, "903KC": 16, "KYF31": 13,
+          "701KC": 12, "SH-02L": 11, "805SH": 9, "SH-01J": 8, "A203KC": 8, "A205SH": 7, "602SH": 7, "KYF42": 6,
+          "PCH-1000": 80, "PCH-2000": 77, "PSP-3000": 73, "PSP-1000": 41, "RED-001": 34, "USG-001": 22,
+          "CTR-001": 17, "CGB-001": 15}
+
+
+def model_key(q):
+    return re.sub(r"[-\s]", "", (q or "").upper())
 MAX_COST_DEFAULT = 20000      # 仕入れ値の上限（円）。設定シートで max_cost を渡せばそちらを優先
 PROFIT_RATIO = 0.3            # 値下げしても「仕入れ値の30%」と最低利益の高いほうは残す
 
@@ -485,6 +497,12 @@ def main():
         page.route("**/*", lambda route: route.abort()
                    if route.request.resource_type in ("image", "media", "font") else route.continue_())
         desc_stops = 0   # 説明文の理由で止めるのは1回5件まで（判定の不具合で大量に止めないため）
+        listed_per_model = {}
+        for x in rows:
+            if x["ebay_item_id"] and x["status"] in ("", "active"):
+                k = model_key(x.get("query"))
+                listed_per_model[k] = listed_per_model.get(k, 0) + 1
+        quota_hit = False   # eBayの出品枠の上限に達したら、この回はもう出品しない
         for r in targets:
             yahoo = is_yahoo(r["mercari_url"])
             if yahoo:
@@ -562,6 +580,11 @@ def main():
                 elif status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
+                elif status == "on_sale" and info and listed_per_model.get(model_key(r.get("query")), 0) >= MAX_PER_MODEL:
+                    upd["result"] = f"同じ機種がすでに{MAX_PER_MODEL}件出品中のため候補から外しました"
+                    upd["status"] = "stopped"
+                elif status == "on_sale" and info and quota_hit:
+                    upd["result"] = "【待機】eBayの月間出品枠の上限のため、枠が空くまで待ちます"
                 elif status == "on_sale" and info:
                     # ---- 販売中の候補はすべてeBayに出品（「出品する」のチェックは不要） ----
                     try:
@@ -575,10 +598,15 @@ def main():
                         upd["ebay_item_id"] = res["ebay_item_id"]
                         upd["result"] = f"eBayに出品しました（${res['price']:.2f}）→ 売り切れ監視を開始"
                         listed += 1
+                        k = model_key(r.get("query"))
+                        listed_per_model[k] = listed_per_model.get(k, 0) + 1
                         notify(f"【出品】{res['title_en']} ${res['price']:.2f}（eBay {res['ebay_item_id']}）")
                     elif err and err.startswith("SKIP:"):
                         upd["result"] = err[5:]
                         upd["status"] = "stopped"   # 相場では利益が出ない → 候補から外す（自動で行を削除）
+                    elif err and re.search(r"limit|限度|上限|exceed", err, re.I):
+                        quota_hit = True   # 出品枠の上限：候補は残して、枠が空いたら出品する
+                        upd["result"] = "【待機】eBayの月間出品枠の上限のため、枠が空くまで待ちます"
                     else:
                         # 失敗理由が次の確認で上書きされないよう「paused」にして残す
                         upd["result"] = f"【出品できず】{err}"
@@ -1127,8 +1155,22 @@ def discover():
             time.sleep(random.uniform(8, 15))
         browser.close()
 
-    found.sort(key=lambda x: x["profit"], reverse=True)
-    added = found[:max_add]
+    # よく売れる機種を優先し、同じ機種は（出品中＋候補で）3件までにする
+    per_model = {}
+    for x in data["rows"]:
+        if x["status"] in ("", "active"):
+            k = model_key(x.get("query"))
+            per_model[k] = per_model.get(k, 0) + 1
+    found.sort(key=lambda x: (SOLD90.get(x["query"], 0), x["profit"]), reverse=True)
+    added = []
+    for x in found:
+        k = model_key(x["query"])
+        if per_model.get(k, 0) >= MAX_PER_MODEL:
+            continue
+        per_model[k] = per_model.get(k, 0) + 1
+        added.append(x)
+        if len(added) >= max_add:
+            break
     if added:
         sheet("append", rows=added)
         best = added[0]
@@ -1224,6 +1266,56 @@ def restore():
     sheet("log", message=msg)
 
 
+def trim():
+    """同じ機種が4件以上出品されている場合、仕入れが安い3件を残して残りをeBayで終了する（1回だけ実行）"""
+    data = sheet("list")
+    token = get_access_token()
+    rows = [r for r in data["rows"] if r["ebay_item_id"] and r["status"] in ("", "active")]
+    groups = {}
+    for r in rows:
+        groups.setdefault(model_key(r.get("query")), []).append(r)
+    updates, ended, kept = [], 0, 0
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(locale="ja-JP", user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
+        for k, rs in groups.items():
+            if len(rs) <= MAX_PER_MODEL:
+                kept += len(rs)
+                continue
+            priced = []
+            for r in rs:
+                try:
+                    if is_yahoo(r["mercari_url"]):
+                        st, info, _ = check_yahoo(r["mercari_url"])
+                    else:
+                        st, info = check_mercari(page, r["mercari_url"])
+                    price = info.get("price") if st == "on_sale" and info else None
+                except Exception:
+                    price = None
+                if price:
+                    priced.append((price, r))
+                else:
+                    kept += 1   # 値段が確認できないものは触らない（売り切れなら通常の監視で止まる）
+            priced.sort(key=lambda t: t[0])
+            for i, (price, r) in enumerate(priced):
+                if i < MAX_PER_MODEL:
+                    kept += 1
+                    continue
+                ok, msg = stop_on_ebay(r["ebay_item_id"], token)
+                if ok:
+                    ended += 1
+                    updates.append({"row": r["row"], "status": "stopped",
+                                    "result": f"同じ機種が多いため終了（仕入れが安い{MAX_PER_MODEL}件を残しました） → {msg}"})
+        browser.close()
+    if updates:
+        sheet("update", updates=updates)
+    msg = f"{now()} 重複機種の整理：残した {kept}件／終了 {ended}件"
+    print(msg)
+    sheet("log", message=msg)
+
+
 def end_stopped():
     """在庫0で止めたままの出品（売り切れ・本体でない商品など）をeBayで終了する（1回だけ実行）"""
     data = sheet("list")
@@ -1252,6 +1344,8 @@ if __name__ == "__main__":
             discover()
         elif len(sys.argv) > 1 and sys.argv[1] == "fixdesc":
             fixdesc()
+        elif len(sys.argv) > 1 and sys.argv[1] == "trim":
+            trim()
         elif len(sys.argv) > 1 and sys.argv[1] == "endstopped":
             end_stopped()
         elif len(sys.argv) > 1 and sys.argv[1] == "restore":
