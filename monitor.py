@@ -886,11 +886,16 @@ def yahoo_search(keyword):
 ACCESSORY_WORDS = ["説明書", "取説", "取扱", "充電器", "充電台", "卓上ホルダ", "卓上ホルダー", "アダプタ", "ACアダプ",
                    "ケーブル", "電池パック", "外箱", "空箱", "元箱のみ", "付属品のみ", "パーツ", "部品",
                    "シェル", "外装", "ハウジング", "筐体", "液晶パネル", "液晶のみ", "画面のみ", "基板", "ボタン",
-                   "スティック", "UMD", "ソフト", "メモリースティック", "メモリーカード", "ポーチ", "スキンシール"]
+                   "スティック", "UMD", "ソフトのみ", "ソフト単品", "ゲームソフト", "メモリースティック", "メモリーカード", "ポーチ", "スキンシール"]
 BODY_WORDS = ["本体", "付き", "付属", "同梱", "セット内容", "揃い", "完品", "一式", "なし", "無し"]
 
 
 ACCESSORY_PRICE_RATIO = 0.2   # eBay相場のこの割合以下の値段なら「本体にしては安すぎる」
+
+
+def looks_like_accessory(title):
+    t = unicodedata.normalize("NFKC", title or "")
+    return any(w in t for w in ACCESSORY_WORDS) and not any(w in t for w in BODY_WORDS)
 
 
 def is_accessory(title, price_jpy, sale_usd, settings):
@@ -1053,7 +1058,9 @@ def restore():
     data = sheet("list")
     token = get_access_token()
     rows = [r for r in data["rows"] if r["ebay_item_id"] and r["status"] == "stopped"
-            and re.search(r"型番 .+ がありませんのためeBayを終了", r.get("result") or "")]
+            and (re.search(r"型番 .+ がありませんのためeBayを終了", r.get("result") or "")
+                 or ("単体のため出品を止めました" in (r.get("result") or "")
+                     and not looks_like_accessory(r.get("title") or "")))]
     updates, ok_n, relist_n, fail_n = [], 0, 0, 0
     for r in rows:
         ack, errs, root = trading_call_root(
