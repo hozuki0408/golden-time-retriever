@@ -375,6 +375,7 @@ GAMEBOY_MIN_PROFIT = 10000
 
 # 出品枠（月350件・2万ドル）を有効に使うためのルール
 MAX_PER_MODEL = 3   # 同じ機種の出品は3件まで（仕入れが安い＝利益が大きいものを残す）
+SWAP_MARGIN = 1000  # 枠がいっぱいのとき、利益がこれ以上大きい候補なら一番利益の小さい出品と入れ替える
 # 過去90日にeBayで売れた台数（多い機種ほど優先して出品枠を使う）
 SOLD90 = {"902KC": 41, "KY-42C": 23, "601SH": 20, "A202KC": 18, "P-01G": 18, "903KC": 16, "KYF31": 13,
           "701KC": 12, "SH-02L": 11, "805SH": 9, "SH-01J": 8, "A203KC": 8, "A205SH": 7, "602SH": 7, "KYF42": 6,
@@ -484,6 +485,8 @@ def main():
     rows, settings = data["rows"], data.get("settings", {})
     KNOWN_MODELS[:] = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "")) if k.strip()]
     targets = [r for r in rows if r["status"] in ("", "active")]
+    # 出品中の商品を先に確認して利益を把握してから、候補を出品する（入れ替えの判断に使う）
+    targets.sort(key=lambda r: 0 if r["ebay_item_id"] else 1)
     watch = [r for r in targets if r["ebay_item_id"]]
     research = [r for r in targets if not r["ebay_item_id"]]
     print(f"{now()} 監視 {len(watch)}件／仕入れ候補 {len(research)}件")
@@ -510,7 +513,25 @@ def main():
             if x["ebay_item_id"] and x["status"] in ("", "active"):
                 k = model_key(x.get("query"))
                 listed_per_model[k] = listed_per_model.get(k, 0) + 1
-        quota_hit = False   # eBayの出品枠の上限に達したら、この回はもう出品しない
+        quota_hit = False   # eBayの出品枠の上限に達したら、入れ替えできるときだけ出品する
+        listed_profit = {}  # 出品中の商品の利益 {行番号: (機種, 利益, eBay出品番号)}
+
+        def swap_out(model=None, cand_p=None):
+            """候補の利益が出品中の一番小さい利益より SWAP_MARGIN 円以上多ければ、その出品を終了して枠を空ける"""
+            pool = [(v[1], row, v) for row, v in listed_profit.items() if model is None or v[0] == model]
+            if not pool or cand_p is None:
+                return False
+            low_p, low_row, (low_model, _, low_id) = min(pool)
+            if cand_p < low_p + SWAP_MARGIN:
+                return False
+            ok, msg = stop_on_ebay(low_id, token or get_access_token())
+            if not ok:
+                return False
+            updates.append({"row": low_row, "status": "stopped",
+                            "result": f"利益が大きい商品（約{int(cand_p):,}円）と入れ替えのため終了（この出品の利益は約{int(low_p):,}円） → {msg}"})
+            del listed_profit[low_row]
+            listed_per_model[low_model] = max(0, listed_per_model.get(low_model, 1) - 1)
+            return True
         for r in targets:
             yahoo = is_yahoo(r["mercari_url"])
             if yahoo:
@@ -568,6 +589,7 @@ def main():
                             p = rev * (1 - fee) - float(settings.get("ship_jpy") or 3000) - info["price"]
                             upd["cost"] = info["price"]
                             upd["profit"] = round(p)
+                            listed_profit[r["row"]] = (model_key(r.get("query")), p, r["ebay_item_id"])
                             upd["margin"] = round(p / rev * 100, 1) if rev else 0
                             if f"${new_price:.2f}" in (r.get("result") or ""):   # 値段が同じなら何もしない
                                 upd["result"] = r["result"]
@@ -588,10 +610,12 @@ def main():
                 elif status in ("sold", "deleted", "auction"):
                     upd["result"] = f"{LABEL[status]}（候補から外しました）"
                     upd["status"] = "stopped"
-                elif status == "on_sale" and info and listed_per_model.get(model_key(r.get("query")), 0) >= cap_for(r.get("query")):
+                elif status == "on_sale" and info and listed_per_model.get(model_key(r.get("query")), 0) >= cap_for(r.get("query")) \
+                        and not swap_out(model_key(r.get("query")), expected_profit(info.get("price"), r.get("query"), settings)):
                     upd["result"] = f"同じ機種がすでに{cap_for(r.get('query'))}件出品中のため候補から外しました"
                     upd["status"] = "stopped"
-                elif status == "on_sale" and info and quota_hit:
+                elif status == "on_sale" and info and quota_hit \
+                        and not swap_out(None, expected_profit(info.get("price"), r.get("query"), settings)):
                     upd["result"] = "【待機】eBayの月間出品枠の上限のため、枠が空くまで待ちます"
                 elif status == "on_sale" and info:
                     # ---- 販売中の候補はすべてeBayに出品（「出品する」のチェックは不要） ----
@@ -613,8 +637,19 @@ def main():
                         upd["result"] = err[5:]
                         upd["status"] = "stopped"   # 相場では利益が出ない → 候補から外す（自動で行を削除）
                     elif err and re.search(r"limit|限度|上限|exceed", err, re.I):
-                        quota_hit = True   # 出品枠の上限：候補は残して、枠が空いたら出品する
+                        quota_hit = True   # 出品枠の上限：利益が大きければ入れ替え、そうでなければ枠が空くまで待つ
                         upd["result"] = "【待機】eBayの月間出品枠の上限のため、枠が空くまで待ちます"
+                        if swap_out(None, expected_profit(info.get("price"), r.get("query"), settings)):
+                            try:
+                                res2, err2 = create_listing(r, info, detail, settings, token)
+                            except Exception as e:
+                                res2, err2 = None, str(e)[:200]
+                            if res2:
+                                upd["ebay_item_id"] = res2["ebay_item_id"]
+                                upd["result"] = f"利益が大きいため入れ替えて出品しました（${res2['price']:.2f}）→ 売り切れ監視を開始"
+                                listed += 1
+                                k = model_key(r.get("query"))
+                                listed_per_model[k] = listed_per_model.get(k, 0) + 1
                     else:
                         # 失敗理由が次の確認で上書きされないよう「paused」にして残す
                         upd["result"] = f"【出品できず】{err}"
@@ -787,6 +822,19 @@ def market_price_usd(cost, query, settings):
     floor = math.ceil((cost + ship + min_profit) / max(0.05, 1 - fee) / fx) - 0.01   # 最低利益が残る最低価格
     target = math.floor(adj(sale, settings)) + 0.99                                  # 実際に売れている値段の目安
     return target, floor
+
+
+def expected_profit(cost, query, settings):
+    """候補を今出品したときに見込める利益（円）。相場が取れなければ None"""
+    try:
+        target, floor = market_price_usd(float(cost), (query or "").strip(), settings)
+        if target is None or target < floor:
+            return None
+        fx = usd_jpy(settings)
+        fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+        return target * fx * (1 - fee) - float(settings.get("ship_jpy") or 3000) - float(cost)
+    except (TypeError, ValueError):
+        return None
 
 
 def list_price_usd(cost, settings):
