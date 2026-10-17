@@ -497,6 +497,12 @@ def main():
     # eBayの認証を最初に確認しておく（売り切れを見つけてから失敗するのを防ぐ）
     token = get_access_token() if watch else None
     updates, blocked, counts, stopped, researched, listed = [], 0, {}, 0, 0, 0
+    sold_on_ebay, sold_n = {}, 0
+    if watch:
+        try:
+            sold_on_ebay = ebay_sold_items(token)   # eBayで売れた商品（仕入れ元で買う必要がある）
+        except Exception as e:
+            print("eBayで売れた商品の確認に失敗:", str(e)[:100])
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(
@@ -558,7 +564,43 @@ def main():
                     desc_stops += 1
                 elif why:
                     upd["result"] = f"【要確認】{why}（一度に止める件数の上限のため止めていません）"
-            if r["ebay_item_id"]:
+            if r["ebay_item_id"] and r["ebay_item_id"] in sold_on_ebay:
+                # ---- eBayで売れた：仕入れ元で買うように目立たせる（この行は自動では消さない） ----
+                s = sold_on_ebay[r["ebay_item_id"]]
+                usd = f"${s['usd']:.2f}" if s.get("usd") else ""
+                src = "Yahoo!フリマ" if yahoo else "メルカリ"
+                upd["status"] = "sold"
+                if status == "on_sale" and (info or {}).get("price"):
+                    p_txt = ""
+                    if s.get("usd"):
+                        fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+                        p = s["usd"] * usd_jpy(settings) * (1 - fee) - float(settings.get("ship_jpy") or 3000) - info["price"]
+                        p_txt = f"・見込み利益 約{int(p):,}円"
+                    upd["cost"] = info["price"]
+                    upd["result"] = (f"🔴【要購入】eBayで売れました（{usd}）。{src}でまだ買えます"
+                                     f"（{int(info['price']):,}円{p_txt}）→ 商品URLから購入してください")
+                else:
+                    # 仕入れ元が売り切れ：同じ機種で利益が残る代わりを探して、B列のURLを差し替える
+                    alt = None
+                    try:
+                        alt = find_alternative(page, r.get("query"), s.get("usd"), settings,
+                                               skip={x["mercari_url"].split("?")[0] for x in rows})
+                    except Exception as e:
+                        print("代わりの商品探しに失敗:", str(e)[:100])
+                    if alt:
+                        upd["mercari_url"] = alt["url"]
+                        upd["cost"] = alt["price"]
+                        upd["result"] = (f"🔴【要購入・代わり】eBayで売れました（{usd}）。元の{src}の商品は売り切れのため、"
+                                         f"同じ機種の代わりにURLを差し替えました（{int(alt['price']):,}円・見込み利益 約{int(alt['profit']):,}円）"
+                                         f"→ 商品URLから購入してください（元の商品：{r['mercari_url']}）")
+                    else:
+                        upd["result"] = (f"⚠️【代わりなし】eBayで売れました（{usd}）が、{src}は{LABEL[status]}で、"
+                                         "同じ機種で利益が残る代わりも見つかりませんでした。購入者にお詫びしてキャンセルしてください")
+                k = model_key(r.get("query"))
+                listed_per_model[k] = max(0, listed_per_model.get(k, 1) - 1)
+                sold_n += 1
+                notify(f"【売れました】{upd['result']}")
+            elif r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
                 if acc:
                     token = token or get_access_token()
@@ -699,7 +741,7 @@ def main():
         notify(f"【注意】メルカリにアクセスを拒否されました（{blocked}件）。クラウドからのアクセスが制限されている可能性があります。")
     # 記録には件数だけを出す（URLや出品番号は出さない）
     summary = "、".join(f"{LABEL[k]} {v}件" for k, v in counts.items())
-    msg = f"{now()} 正常終了：{summary}／eBay停止 {stopped}件／利益計算 {researched}件／出品 {listed}件"
+    msg = f"{now()} 正常終了：{summary}／eBayで売れた {sold_n}件／eBay停止 {stopped}件／利益計算 {researched}件／出品 {listed}件"
     print(msg)
     sheet("log", message=msg)
 
@@ -855,6 +897,32 @@ def upload_pictures(urls, token):
         full = root.findtext("e:SiteHostedPictureDetails/e:FullURL", default="", namespaces=NS)
         if full:
             out.append(full)
+    return out
+
+
+def ebay_sold_items(token, days=30):
+    """最近eBayで売れた出品 {出品番号: {"usd": 売れた値段, "buyer": 購入者ID, "date": 日時}}"""
+    out = {}
+    for page_no in range(1, 6):
+        ack, errs, root = trading_call_root(
+            "GetMyeBaySelling",
+            f"<SoldList><Include>true</Include><DurationInDays>{days}</DurationInDays>"
+            f"<Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>{page_no}</PageNumber></Pagination></SoldList>",
+            token)
+        if ack not in ("Success", "Warning"):
+            raise RuntimeError("売れた商品の取得に失敗：" + " / ".join(errs)[:200])
+        for t in root.iter("{" + NS["e"] + "}Transaction"):
+            item_id = t.findtext("e:Item/e:ItemID", default="", namespaces=NS)
+            if not item_id:
+                continue
+            usd = (t.findtext("e:TotalTransactionPrice", default="", namespaces=NS)
+                   or t.findtext("e:TransactionPrice", default="", namespaces=NS))
+            out[item_id] = {"usd": float(usd) if usd else None,
+                            "buyer": t.findtext("e:Buyer/e:UserID", default="", namespaces=NS),
+                            "date": t.findtext("e:CreatedDate", default="", namespaces=NS)}
+        pages = root.findtext("e:SoldList/e:PaginationResult/e:TotalNumberOfPages", default="1", namespaces=NS)
+        if page_no >= int(pages or 1):
+            break
     return out
 
 
@@ -1124,6 +1192,50 @@ def is_accessory(title, price_jpy, sale_usd, settings):
         return False   # 値段か相場が分からないときは外さない
 
 
+MERCARI_FIXED = "&d664efe3-ae5a-4824-b729-e789bf93aba9=B38F1DC9286E0B80812D9B19DB14298C1FF1116CA8332D9EE9061026635C9088"   # 出品形式：通常出品（オークションを除く）
+
+
+def find_alternative(page, query, sold_usd, settings, skip=()):
+    """eBayで売れたのに仕入れ元が売り切れていたとき、同じ機種で利益が残る代わりを探す（利益が一番大きいもの）"""
+    q = (query or "").strip()
+    if not q or not sold_usd:
+        return None
+    gi = game_info(q)
+    items = []
+    url = ("https://jp.mercari.com/search?status=on_sale&sort=price&order=asc"
+           f"&category_id={gi['mercari'] if gi else '860'}&keyword="
+           + ("" if gi and gi.get("exact") else requests.utils.quote(q)) + MERCARI_FIXED)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_selector('a[href*="/item/m"], a[href*="/shops/product/"]', timeout=25000)
+        items += [dict(it, exact=bool(gi and gi.get("exact"))) for it in page.evaluate(SEARCH_JS)]
+    except Exception:
+        pass
+    try:
+        items += yahoo_search(gi.get("yahoo_q", q) if gi else q)
+    except Exception:
+        pass
+    fx = usd_jpy(settings)
+    fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
+    ship = float(settings.get("ship_jpy") or 3000)
+    best = None
+    for it in items:
+        u = it["url"].split("?")[0]
+        if u in skip or not it.get("price") or it.get("auction") or it["price"] > max_cost(settings):
+            continue
+        title = it.get("title") or ""
+        if not it.get("exact") and not has_model(title, q) and not (gi and gi.get("alias") and match_game(title, q)):
+            continue   # 同じ機種と確認できないものは使わない
+        if looks_like_accessory(title) or is_accessory(title, it["price"], sold_usd, settings):
+            continue
+        if gi and game_reject_reason(title, q, it["price"], sold_usd, settings):
+            continue
+        p = sold_usd * fx * (1 - fee) - ship - it["price"]
+        if p > 0 and (best is None or p > best["profit"]):
+            best = {"url": u, "price": it["price"], "profit": p, "title": title}
+    return best
+
+
 def discover():
     data = sheet("list")
     settings = data.get("settings", {})
@@ -1145,7 +1257,7 @@ def discover():
             gi = game_info(kw)
             url = ("https://jp.mercari.com/search?status=on_sale&sort=created_time&order=desc"
                    f"&category_id={gi['mercari'] if gi else '860'}&keyword="
-                   + ("" if gi and gi.get("exact") else requests.utils.quote(kw)))   # 本体カテゴリ（機種別カテゴリなら検索語なし）
+                   + ("" if gi and gi.get("exact") else requests.utils.quote(kw)) + MERCARI_FIXED)   # 本体カテゴリ・通常出品のみ（機種別カテゴリなら検索語なし）
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_selector('a[href*="/item/m"], a[href*="/shops/product/"]', timeout=25000)
