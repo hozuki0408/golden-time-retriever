@@ -583,23 +583,9 @@ def main():
                     upd["result"] = (f"🔴【要購入】eBayで売れました（{usd}）。{src}でまだ買えます"
                                      f"（{int(info['price']):,}円{p_txt}）→ 商品URLから購入してください")
                 else:
-                    # 仕入れ元が売り切れ：同じ機種で利益が残る代わりを探して、B列のURLを差し替える
-                    alt = None
-                    try:
-                        alt = find_alternative(page, r.get("query"), s.get("usd"), settings,
-                                               skip={x["mercari_url"].split("?")[0] for x in rows})
-                    except Exception as e:
-                        print("代わりの商品探しに失敗:", str(e)[:100])
-                    if alt:
-                        upd["mercari_url"] = alt["url"]
-                        upd["cost"] = alt["price"]
-                        upd["profit"] = round(alt["profit"])
-                        upd["result"] = (f"🔴【要購入・代わり】eBayで売れました（{usd}）。元の{src}の商品は売り切れのため、"
-                                         f"同じ機種の代わりにURLを差し替えました（{int(alt['price']):,}円・見込み利益 約{int(alt['profit']):,}円）"
-                                         f"→ 商品URLから購入してください（元の商品：{r['mercari_url']}）")
-                    else:
-                        upd["result"] = (f"⚠️【代わりなし】eBayで売れました（{usd}）が、{src}は{LABEL[status]}で、"
-                                         "同じ機種で利益が残る代わりも見つかりませんでした。購入者にお詫びしてキャンセルしてください")
+                    # 仕入れ元が売り切れ：代わりの商品は使わず、購入者にお詫びしてキャンセルする
+                    upd["result"] = (f"⚠️【確認】【仕入れ先が売り切れ】eBayで売れました（{usd}）が、{src}はすでに{LABEL[status]}です。"
+                                     "購入者にお詫びしてキャンセルしてください（キャンセルが済んだらこの行を削除してください）")
                 k = model_key(r.get("query"))
                 listed_per_model[k] = max(0, listed_per_model.get(k, 1) - 1)
                 sold_n += 1
@@ -738,21 +724,8 @@ def main():
                 continue
             if st not in ("sold", "deleted"):
                 continue
-            try:
-                usd = float(r.get("ebay_usd") or 0) or None
-            except (TypeError, ValueError):
-                usd = None
-            try:
-                alt = find_alternative(page, r.get("query"), usd, settings,
-                                       skip={x["mercari_url"].split("?")[0] for x in rows})
-            except Exception:
-                alt = None
             msg = ("⚠️【確認】仕入れ先が売り切れになりました。自分で買った場合は「仕入れた」にチェックしてください。"
-                   "まだ買っていない場合は")
-            if alt:
-                msg += f"代わりはこちら：{alt['url']}（{int(alt['price']):,}円・見込み利益 約{int(alt['profit']):,}円）"
-            else:
-                msg += "同じ機種で利益が残る代わりが見つからないので、購入者にお詫びしてキャンセルしてください"
+                   "買っていない場合は、購入者にお詫びしてキャンセルしてください（キャンセルが済んだらこの行を削除してください）")
             updates.append({"row": r["row"], "result": msg})
             notify(f"【確認】{msg}")
         browser.close()
