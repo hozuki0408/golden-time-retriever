@@ -1,4 +1,4 @@
-name: 1回だけの作業（同じ機種の重複整理）
+name: 1回だけの作業（発送先から日本を除外）
 
 on:
   workflow_dispatch:          # 手動実行のみ
@@ -32,8 +32,8 @@ jobs:
 
       - run: python -m playwright install --with-deps chromium
 
-      - name: 同じ機種の重複を整理
-        run: python monitor.py trim
+      - name: 配送ポリシーで日本を除外
+        run: python monitor.py excludejp
         env:
           EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
