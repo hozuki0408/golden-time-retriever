@@ -569,7 +569,7 @@ def main():
                 s = sold_on_ebay[r["ebay_item_id"]]
                 usd = f"${s['usd']:.2f}" if s.get("usd") else ""
                 src = "Yahoo!フリマ" if yahoo else "メルカリ"
-                upd["status"] = "sold"
+                upd["status"] = PENDING
                 if s.get("usd"):
                     upd["ebay_usd"] = s["usd"]   # 実際に売れた値段（売上表に移すときに使う）
                 if status == "on_sale" and (info or {}).get("price"):
@@ -724,6 +724,37 @@ def main():
                 sheet("update", updates=updates)
                 updates = []
             time.sleep(random.uniform(0.5, 1.5) if yahoo else random.uniform(1.5, 3))
+
+        # ---- 「要仕入れ」の行：まだ仕入れていないうちに仕入れ先が売り切れたら知らせる ----
+        for r in [x for x in rows if x["status"] == PENDING and x.get("list") is not True]:
+            if "【確認】" in (r.get("result") or ""):
+                continue   # 一度知らせたものは繰り返さない
+            try:
+                if is_yahoo(r["mercari_url"]):
+                    st, _, _ = check_yahoo(r["mercari_url"])
+                else:
+                    st, _ = check_mercari(page, r["mercari_url"])
+            except Exception:
+                continue
+            if st not in ("sold", "deleted"):
+                continue
+            try:
+                usd = float(r.get("ebay_usd") or 0) or None
+            except (TypeError, ValueError):
+                usd = None
+            try:
+                alt = find_alternative(page, r.get("query"), usd, settings,
+                                       skip={x["mercari_url"].split("?")[0] for x in rows})
+            except Exception:
+                alt = None
+            msg = ("⚠️【確認】仕入れ先が売り切れになりました。自分で買った場合は「仕入れた」にチェックしてください。"
+                   "まだ買っていない場合は")
+            if alt:
+                msg += f"代わりはこちら：{alt['url']}（{int(alt['price']):,}円・見込み利益 約{int(alt['profit']):,}円）"
+            else:
+                msg += "同じ機種で利益が残る代わりが見つからないので、購入者にお詫びしてキャンセルしてください"
+            updates.append({"row": r["row"], "result": msg})
+            notify(f"【確認】{msg}")
         browser.close()
 
     sheet("update", updates=updates)
@@ -1196,6 +1227,7 @@ def is_accessory(title, price_jpy, sale_usd, settings):
         return False   # 値段か相場が分からないときは外さない
 
 
+PENDING = "要仕入れ"   # eBayで売れて、まだ仕入れていない行の状態
 MERCARI_FIXED = "&d664efe3-ae5a-4824-b729-e789bf93aba9=B38F1DC9286E0B80812D9B19DB14298C1FF1116CA8332D9EE9061026635C9088"   # 出品形式：通常出品（オークションを除く）
 
 
