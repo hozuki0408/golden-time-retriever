@@ -1484,6 +1484,40 @@ def trim():
     sheet("log", message=msg)
 
 
+def exclude_japan():
+    """配送ポリシーの発送先から日本を除外する（画面では地域単位でしか選べないため、APIで国単位に設定）"""
+    settings = sheet("list").get("settings", {})
+    name = str(settings.get("ship_profile") or "").strip()
+    base = "https://api.ebay.com/sell/account/v1/fulfillment_policy"
+    h = {"Authorization": f"Bearer {get_access_token()}", "Content-Type": "application/json",
+         "Content-Language": "en-US", "Accept-Language": "en-US"}
+    r = requests.get(base, params={"marketplace_id": "EBAY_US"}, headers=h, timeout=30)
+    r.raise_for_status()
+    pol = next((x for x in r.json().get("fulfillmentPolicies", []) if x.get("name") == name), None)
+    if not pol:
+        print(f"配送ポリシー「{name}」が見つかりません")
+        return
+
+    def summary(x):
+        return {"exclude": [e.get("regionName") for e in (x.get("shipToLocations") or {}).get("regionExcluded", [])],
+                "options": [(o.get("optionType"), [(sv.get("shippingServiceCode"), sv.get("freeShipping"),
+                             [g.get("regionName") for g in (sv.get("shipToLocations") or {}).get("regionIncluded", [])])
+                             for sv in o.get("shippingServices", [])]) for o in x.get("shippingOptions", [])],
+                "handling": x.get("handlingTime")}
+    print("変更前:", json.dumps(summary(pol), ensure_ascii=False))
+    ex = pol.setdefault("shipToLocations", {}).setdefault("regionExcluded", [])
+    if any(e.get("regionName") == "JP" for e in ex):
+        print("日本はすでに除外されています")
+        return
+    ex.append({"regionName": "JP", "regionType": "COUNTRY"})
+    pid = pol.pop("fulfillmentPolicyId")
+    r2 = requests.put(f"{base}/{pid}", headers=h, json=pol, timeout=30)
+    print("更新:", r2.status_code, r2.text[:600])
+    r3 = requests.get(f"{base}/{pid}", headers=h, timeout=30)
+    print("変更後:", json.dumps(summary(r3.json()), ensure_ascii=False))
+    sheet("log", message=f"{now()} 配送ポリシーで日本を除外：{'成功' if r2.ok else '失敗'}")
+
+
 def end_stopped():
     """在庫0で止めたままの出品（売り切れ・本体でない商品など）をeBayで終了する（1回だけ実行）"""
     data = sheet("list")
@@ -1512,6 +1546,8 @@ if __name__ == "__main__":
             discover()
         elif len(sys.argv) > 1 and sys.argv[1] == "fixdesc":
             fixdesc()
+        elif len(sys.argv) > 1 and sys.argv[1] == "excludejp":
+            exclude_japan()
         elif len(sys.argv) > 1 and sys.argv[1] == "trim":
             trim()
         elif len(sys.argv) > 1 and sys.argv[1] == "endstopped":
