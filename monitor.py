@@ -570,12 +570,15 @@ def main():
                 usd = f"${s['usd']:.2f}" if s.get("usd") else ""
                 src = "Yahoo!フリマ" if yahoo else "メルカリ"
                 upd["status"] = "sold"
+                if s.get("usd"):
+                    upd["ebay_usd"] = s["usd"]   # 実際に売れた値段（売上表に移すときに使う）
                 if status == "on_sale" and (info or {}).get("price"):
                     p_txt = ""
                     if s.get("usd"):
                         fee = (float(settings.get("fee_pct") or 15) + float(settings.get("other_pct") or 2)) / 100
                         p = s["usd"] * usd_jpy(settings) * (1 - fee) - float(settings.get("ship_jpy") or 3000) - info["price"]
                         p_txt = f"・見込み利益 約{int(p):,}円"
+                        upd["profit"] = round(p)
                     upd["cost"] = info["price"]
                     upd["result"] = (f"🔴【要購入】eBayで売れました（{usd}）。{src}でまだ買えます"
                                      f"（{int(info['price']):,}円{p_txt}）→ 商品URLから購入してください")
@@ -590,6 +593,7 @@ def main():
                     if alt:
                         upd["mercari_url"] = alt["url"]
                         upd["cost"] = alt["price"]
+                        upd["profit"] = round(alt["profit"])
                         upd["result"] = (f"🔴【要購入・代わり】eBayで売れました（{usd}）。元の{src}の商品は売り切れのため、"
                                          f"同じ機種の代わりにURLを差し替えました（{int(alt['price']):,}円・見込み利益 約{int(alt['profit']):,}円）"
                                          f"→ 商品URLから購入してください（元の商品：{r['mercari_url']}）")
