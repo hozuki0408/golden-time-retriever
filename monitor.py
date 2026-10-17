@@ -180,7 +180,7 @@ def check_mercari(page, url):
     try:
         page.wait_for_function(
             """() => { const t = document.body ? document.body.innerText : '';
-                return /購入手続きへ|売り切れ|削除されています|見つかりません|公開停止/.test(t); }""",
+                return /購入手続きへ|売り切れ|削除されています|見つかりません|公開停止|入札する|オークション商品/.test(t); }""",
             timeout=25000,
         )
     except Exception:
@@ -613,7 +613,7 @@ def main():
                     if ok:
                         upd["status"] = "stopped"
                         stopped += 1
-                elif status in ("sold", "deleted"):
+                elif status in ("sold", "deleted", "auction"):
                     ok, msg = stop_on_ebay(r["ebay_item_id"], token)
                     upd["result"] = f"{LABEL[status]} → {msg}"
                     if ok:
