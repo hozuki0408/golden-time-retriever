@@ -54,6 +54,15 @@ def notify(msg):
             print("Discord通知に失敗しました")
 
 
+def alert(subject, body):
+    """売れた・要確認など、すぐ見てほしい知らせだけをメール（スマホのGmail）とDiscordに送る"""
+    notify(f"{subject}\n{body}")
+    try:
+        sheet("mail", subject=subject, body=body)
+    except Exception:
+        print("メール通知に失敗しました")
+
+
 # ---------- スプレッドシート ----------
 def sheet(action, **payload):
     # Googleの応答がたまに壊れる（書き込み自体は成功していることが多い）ので、数回やり直す
@@ -589,7 +598,12 @@ def main():
                 k = model_key(r.get("query"))
                 listed_per_model[k] = max(0, listed_per_model.get(k, 1) - 1)
                 sold_n += 1
-                notify(f"【売れました】{upd['result']}")
+                name = (title_now or r.get("title") or r.get("query") or "")[:40]
+                alert(f"【要仕入れ】eBayで売れました {usd}｜{name}",
+                      f"{upd['result']}\n\n"
+                      f"■ 仕入れ先（{src}）\n{r['mercari_url']}\n\n"
+                      f"■ eBay出品番号：{r['ebay_item_id']}\n\n"
+                      "購入したら、スプレッドシートの「仕入れた」にチェックを入れてください。")
             elif r["ebay_item_id"]:
                 # ---- 出品中の商品：売り切れたらeBayを止める ----
                 if acc:
@@ -727,7 +741,8 @@ def main():
             msg = ("⚠️【確認】仕入れ先が売り切れになりました。自分で買った場合は「仕入れた」にチェックしてください。"
                    "買っていない場合は、購入者にお詫びしてキャンセルしてください（キャンセルが済んだらこの行を削除してください）")
             updates.append({"row": r["row"], "result": msg})
-            notify(f"【確認】{msg}")
+            alert(f"【確認】仕入れ先が売り切れました｜{(r.get('title') or r.get('query') or '')[:40]}",
+                  f"{msg}\n\n■ 仕入れ先\n{r['mercari_url']}\n\n■ eBay出品番号：{r['ebay_item_id']}")
         browser.close()
 
     sheet("update", updates=updates)
