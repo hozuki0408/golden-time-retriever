@@ -1,0 +1,43 @@
+name: 1回だけの作業（説明文の作り直し）
+
+on:
+  workflow_dispatch:          # 手動実行のみ
+
+concurrency:
+  group: oneoff
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: ブラウザのキャッシュ
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('requirements.txt') }}
+
+      - run: python -m playwright install --with-deps chromium
+
+      - name: 同じ商品の写真の確認（何も変更しない）
+        run: python monitor.py dupdebug 366747044665
+        env:
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
+          EBAY_REFRESH_TOKEN: ${{ secrets.EBAY_REFRESH_TOKEN }}
+          SHEET_API_URL: ${{ secrets.SHEET_API_URL }}
+          SHEET_API_KEY: ${{ secrets.SHEET_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

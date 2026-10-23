@@ -1,0 +1,58 @@
+name: メルカリ在庫監視
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # 30分ごと（GitHubの混雑で数分〜十数分遅れることがあります）
+  workflow_dispatch:          # 「Run workflow」ボタンで手動実行もできる
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: ブラウザのキャッシュ
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('requirements.txt') }}
+
+      - run: python -m playwright install --with-deps chromium
+      - name: 写真の記録のキャッシュ（同じ商品の見分けに使う）
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: imghash-${{ github.run_id }}
+          restore-keys: imghash-
+
+      - name: 監視を実行
+        run: python monitor.py
+        env:
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
+          EBAY_REFRESH_TOKEN: ${{ secrets.EBAY_REFRESH_TOKEN }}
+          SHEET_API_URL: ${{ secrets.SHEET_API_URL }}
+          SHEET_API_KEY: ${{ secrets.SHEET_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: 自動実行が60日で止まらないようにする
+        if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monitor.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}

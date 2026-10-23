@@ -1,0 +1,59 @@
+name: 仕入れ候補さがし
+
+on:
+  schedule:
+    - cron: "23 * * * *"   # 1時間ごと（GitHubの混雑で数分〜十数分遅れることがあります）
+  workflow_dispatch:
+
+concurrency:
+  group: discover   # 在庫監視とは別に動く（待たされない）
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45   # 探す18分＋在庫の見張りを待つ最大18分＋準備
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]   # 4本に分けて同時に探す（機種を4等分）
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: ブラウザのキャッシュ
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('requirements.txt') }}
+      - run: python -m playwright install --with-deps chromium
+      - name: eBay相場のキャッシュ（6時間以内の相場を使い回す）
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: market-${{ github.run_id }}-${{ matrix.shard }}
+          restore-keys: market-
+      - name: 候補をさがす
+        run: python monitor.py discover
+        env:
+          SHARDS: "4"
+          GH_TOKEN: ${{ github.token }}   # 在庫の見張りが動いているかを確かめる（動いている間は待つ）
+          SHARD: ${{ matrix.shard }}
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
+          EBAY_REFRESH_TOKEN: ${{ secrets.EBAY_REFRESH_TOKEN }}
+          SHEET_API_URL: ${{ secrets.SHEET_API_URL }}
+          SHEET_API_KEY: ${{ secrets.SHEET_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: 自動実行が60日で止まらないようにする
+        if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/discover.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
