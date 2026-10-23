@@ -413,7 +413,7 @@ DETAIL_JS = """() => ({
 INFO_JS = """() => {
     const title = (document.querySelector('h1')?.innerText || document.title.replace(/ - メルカリ.*$/, '')).trim();
     const main = (document.querySelector('main') || document.body).innerText;
-    const head = main.split('商品の説明')[0];
+    const head = main.split('商品の説明')[0].replace(/過去価格\\s*¥\\s*[\\d,]+/g, '').replace(/\\d+\\s*%\\s*OFF/gi, '');   // メルカリShopsの値引き表示（過去価格・◯%OFF）は除く
     const pe = document.querySelector('[data-testid="price"]');   // 値段の欄を優先して読む
     const pm = pe ? pe.innerText.replace(/\\s/g, '').match(/([\\d,]+)/) : null;
     const m = pm || head.match(/¥\\s*([\\d,]+)/);
@@ -2114,7 +2114,9 @@ SEARCH_JS = """async () => {
         .filter(a => !a.getAttribute('href').includes('ad_id'))   // 広告枠は除く
         .map(a => {
             const img = a.querySelector('img');
-            const m = a.innerText.match(/([\\d,]+)/);
+            const t = a.innerText.replace(/\\d+\\s*%\\s*OFF/gi, '');   // メルカリShopsの「6%OFF」を値段と間違えない
+            const ys = [...t.matchAll(/[¥￥]\\s*([\\d,]+)/g)].map(x => parseInt(x[1].replace(/,/g, ''), 10));
+            const m = ys.length ? [null, String(Math.min(...ys))] : t.match(/([\\d,]+)/);   // 値引き前と後があれば安いほう
             return { auction: /現在/.test(a.innerText),   // オークションは「現在 ¥◯◯」と表示される
                      url: 'https://jp.mercari.com' + a.getAttribute('href').split('?')[0],
                      title: img ? img.alt.replace(/のサムネイル$/, '') : '',
