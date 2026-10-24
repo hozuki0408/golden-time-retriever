@@ -2806,10 +2806,11 @@ if __name__ == "__main__":
             main()
     except Exception as e:
         # 通信が一瞬つながらなかっただけのエラーは「失敗」にしない（失敗メールが届かないように）。次の回で自然にやり直される
-        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) or type(e).__name__ == "TimeoutError":
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) or type(e).__name__ == "TimeoutError" \
+                or (isinstance(e, RuntimeError) and re.search(r"応答が読めません|\(5\d\d\)|timed out|タイムアウト|too many times|Lock|ロック", str(e))):
             print("通信が一時的につながりませんでした。次の回でやり直します:", type(e).__name__)
             try:
-                sheet("log", message=f"{now()} 通信エラー（一時的・次の回でやり直し）：{type(e).__name__}")
+                sheet("log", message=f"{now()} 通信エラー（一時的・次の回でやり直し）：{type(e).__name__} {str(e)[:120]}")
             except Exception:
                 pass
             sys.exit(0)
