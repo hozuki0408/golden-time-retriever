@@ -417,7 +417,9 @@ INFO_JS = """() => {
     const pe = document.querySelector('[data-testid="price"]');   // 値段の欄を優先して読む
     const pm = pe ? pe.innerText.replace(/\\s/g, '').match(/([\\d,]+)/) : null;
     const m = pm || head.match(/¥\\s*([\\d,]+)/);
-    return { title, price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null };
+    const sa = document.querySelector('a[href*="/shops/profile/"], a[href*="/user/profile/"]');   // 出品者（ショップ・個人）
+    const sm = sa ? (sa.getAttribute('href') || '').match(/(?:shops|user)\\/profile\\/([^\\/?#]+)/) : null;
+    return { title, price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null, seller: sm ? sm[1] : '' };
 }"""
 
 # ---------- 仕入れ候補の利益計算 ----------
@@ -976,6 +978,7 @@ def main():
 def _main():
     data = sheet("list")
     rows, settings = data["rows"], data.get("settings", {})
+    excluded = excluded_sellers(data)   # 「除外者リスト」シートの出品者（この人の商品は候補にも出品にもしない）
     KNOWN_MODELS[:] = [k.strip() for k in re.split(r"[,、\n]", str(settings.get("keywords") or "")) if k.strip()]
     targets = [r for r in rows if r["status"] in ("", "active")]
     # 出品中の商品を先に確認して利益を把握してから、候補を出品する（入れ替えの判断に使う）
@@ -1113,6 +1116,8 @@ def _main():
             acc_why = acc_note = ""
             if is_rakuma(r["mercari_url"]):
                 acc, acc_why = True, "ラクマからの仕入れはやめたため"   # 出品中・候補ともに止める
+            if not acc and seller_id((info or {}).get("seller")) in excluded:
+                acc, acc_why = True, "除外者リストの出品者の商品"   # 出品中・候補ともに止める
             if not acc and reserved_reason(title_now):
                 acc_why = reserved_reason(title_now)   # 専用出品は買えないので候補・出品とも止める
                 acc = True
@@ -2169,13 +2174,24 @@ def check_yahoo(url):
         return "unknown", {}, {}
     st = j.get("status")
     status = "on_sale" if st == "OPEN" else "sold" if st in ("SOLD", "CLOSED") else "unknown"
-    info = {"title": j.get("title", ""), "price": j.get("price")}
+    info = {"title": j.get("title", ""), "price": j.get("price"), "seller": (j.get("seller") or {}).get("id", "")}
     detail = {"images": [i.get("url") for i in j.get("images", []) if i.get("url")][:12],
               "description": j.get("description", ""),
               "condition": (j.get("condition") or {}).get("text", ""),
               "category": " > ".join(c.get("name", "") for c in ((j.get("category") or {}).get("path") or []))
                           or (j.get("category") or {}).get("name", "")}
     return status, info, detail
+
+
+def seller_id(v):
+    """出品者のID（URLを貼られても最後の部分だけにそろえる）"""
+    v = str(v or "").strip().rstrip("/")
+    m = re.search(r"(?:shops/profile|user/profile|shops|user)/([^/?#]+)", v)
+    return (m.group(1) if m else v).strip()
+
+
+def excluded_sellers(data):
+    return {seller_id(x.get("id")) for x in (data.get("excluded") or []) if seller_id(x.get("id"))}
 
 
 def yahoo_search(keyword):
@@ -2190,7 +2206,7 @@ def yahoo_search(keyword):
         if it.get("condition") == "used80":
             continue          # 全体的に状態が悪い
         out.append({"url": f"https://paypayfleamarket.yahoo.co.jp/item/{it['id']}",
-                    "title": it.get("title", ""), "price": it.get("price")})
+                    "title": it.get("title", ""), "price": it.get("price"), "seller": it.get("sellerId", "")})
     return out
 
 
@@ -2308,6 +2324,7 @@ def discover():
     min_profit = float(settings.get("min_profit") or 1500)
     max_add = int(float(settings.get("max_add") or 5))
     exclude = [w.strip() for w in re.split(r"[,、\n]", str(settings.get("exclude") or "")) if w.strip()]
+    excluded = excluded_sellers(data)
 
     found, seen, checked = [], set(), 0
     load_market_cache()   # 前回までに調べたeBay相場（6時間以内）を使い回す
@@ -2378,6 +2395,8 @@ def discover():
                     continue
                 seen.add(u)
                 if any(w in it["title"] for w in exclude) or reserved_reason(it["title"]):
+                    continue
+                if seller_id(it.get("seller")) in excluded:   # 除外者リストの出品者
                     continue
                 if gi and gi.get("alias"):
                     q = kw if match_game(it["title"], kw) else ""   # 呼び名で機種を見分ける
