@@ -2786,6 +2786,14 @@ if __name__ == "__main__":
         else:
             main()
     except Exception as e:
+        # 通信が一瞬つながらなかっただけのエラーは「失敗」にしない（失敗メールが届かないように）。次の回で自然にやり直される
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) or type(e).__name__ == "TimeoutError":
+            print("通信が一時的につながりませんでした。次の回でやり直します:", type(e).__name__)
+            try:
+                sheet("log", message=f"{now()} 通信エラー（一時的・次の回でやり直し）：{type(e).__name__}")
+            except Exception:
+                pass
+            sys.exit(0)
         notify(f"【エラー】監視中に問題が起きました: {e}")
         print("エラーが起きました（詳細はスプレッドシートの「設定」シートを確認）:", type(e).__name__)
         try:
